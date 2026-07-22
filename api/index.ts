@@ -161,61 +161,77 @@ class TranscriptError extends Error {
   }
 }
 
-function httpsPostJson(url: string, body: unknown): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const jsonBody = JSON.stringify(body);
-    const options: https.RequestOptions = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Content-Length': Buffer.byteLength(jsonBody),
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        'Accept': 'application/json',
-      },
-    };
-    const req = https.request(options, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString('utf-8');
-        try { resolve(JSON.parse(raw)); }
-        catch { reject(new Error(`Ongeldige JSON-response (HTTP ${res.statusCode})`)); }
+/** Voer een HTTPS-request uit en retourneer response als string, met redirect-following. */
+function httpsRequest(url: string, method: string, body?: string, contentType?: string): Promise<{ statusCode: number; body: string }> {
+  const maxRedirects = 5;
+  let redirectCount = 0;
+
+  const doRequest = (currentUrl: string, currentMethod: string, currentBody?: string): Promise<{ statusCode: number; body: string }> => {
+    return new Promise((resolve, reject) => {
+      const urlObj = new URL(currentUrl);
+      const options: https.RequestOptions = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: currentMethod,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        },
+      };
+
+      if (currentBody !== undefined && contentType) {
+        options.headers = {
+          ...options.headers,
+          'Content-Type': contentType,
+          'Content-Length': Buffer.byteLength(currentBody),
+        };
+      }
+
+      const req = https.request(options, (res) => {
+        const { statusCode, headers: respHeaders } = res;
+        const location = respHeaders['location'] as string | undefined;
+
+        // Volg redirect (303 → GET, 301/302/307/308 → zelfde methode)
+        if (statusCode && statusCode >= 300 && statusCode < 400 && location && redirectCount < maxRedirects) {
+          redirectCount++;
+          const redirectUrl = new URL(location, currentUrl).href;
+          const redirectMethod = statusCode === 303 ? 'GET' : currentMethod;
+          resolve(doRequest(redirectUrl, redirectMethod));
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          resolve({ statusCode: statusCode || 0, body: Buffer.concat(chunks).toString('utf-8') });
+        });
       });
+
+      req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
+      if (currentBody !== undefined) req.write(currentBody);
+      req.end();
     });
-    req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
-    req.write(jsonBody);
-    req.end();
+  };
+
+  return doRequest(url, method, body);
+}
+
+function httpsPostJson(url: string, body: unknown): Promise<unknown> {
+  const jsonBody = JSON.stringify(body);
+  return httpsRequest(url, 'POST', jsonBody, 'application/json; charset=utf-8').then((res) => {
+    if (res.statusCode >= 400) {
+      throw new Error(`HTTP ${res.statusCode} van InnerTube: ${res.body.slice(0, 200)}`);
+    }
+    try { return JSON.parse(res.body); }
+    catch { throw new Error(`Ongeldige JSON-response (HTTP ${res.statusCode}): ${res.body.slice(0, 200)}`); }
   });
 }
 
 function httpsGet(url: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const options: https.RequestOptions = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        'Accept': 'text/xml, application/xml, */*',
-      },
-    };
-    const req = https.request(options, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
-      res.on('end', () => {
-        if (res.statusCode && res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode} bij ophalen timedtext`));
-          return;
-        }
-        resolve(Buffer.concat(chunks).toString('utf-8'));
-      });
-    });
-    req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
-    req.end();
+  return httpsRequest(url, 'GET').then((res) => {
+    if (res.statusCode >= 400) {
+      throw new Error(`HTTP ${res.statusCode} bij ophalen timedtext`);
+    }
+    return res.body;
   });
 }
 
