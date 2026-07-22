@@ -1,6 +1,5 @@
-import { createServer, IncomingMessage, ServerResponse } from 'node:http';
+import { IncomingMessage, ServerResponse } from 'node:http';
 
-const PORT = parseInt(process.env.PORT || '3000', 10);
 const APP_PASSWORD = process.env.APP_PASSWORD;
 
 /** Parse the Basic Auth credentials from the Authorization header. */
@@ -14,7 +13,7 @@ function parseBasicAuth(headers: IncomingMessage['headers']): string | null {
     const decoded = Buffer.from(base64, 'base64').toString('utf-8');
     const colonIndex = decoded.indexOf(':');
     if (colonIndex === -1) return null;
-    return decoded.slice(colonIndex + 1); // return the password part
+    return decoded.slice(colonIndex + 1);
   } catch {
     return null;
   }
@@ -22,29 +21,29 @@ function parseBasicAuth(headers: IncomingMessage['headers']): string | null {
 
 /** Send a 401 response that triggers the browser's Basic Auth dialog. */
 function requireAuth(res: ServerResponse): void {
-  res.writeHead(401, {
-    'WWW-Authenticate': 'Basic realm="Cloud AI POC", charset="UTF-8"',
-    'Content-Type': 'application/json',
-  });
+  res.statusCode = 401;
+  res.setHeader('WWW-Authenticate', 'Basic realm="Cloud AI POC", charset="UTF-8"');
+  res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify({ error: 'Authorization required' }));
 }
 
-/** Handle a single HTTP request. */
-function handleRequest(req: IncomingMessage, res: ServerResponse): void {
+/** Main request handler voor alle routes (behalve /health, die gaat via api/health.ts). */
+export default function handler(req: IncomingMessage, res: ServerResponse): void {
   const url = req.url || '/';
   const method = req.method || 'GET';
 
-  // --- Healthcheck (openbaar) ---
+  // --- Healthcheck (openbaar) — mocht hij hier toch komen via rewrite ---
   if (method === 'GET' && url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ status: 'ok' }));
     return;
   }
 
   // --- Alle andere routes vereisen authenticatie ---
   if (!APP_PASSWORD) {
-    // Als er geen wachtwoord is geconfigureerd, geef een fout
-    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.statusCode = 500;
+    res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ error: 'APP_PASSWORD not configured' }));
     return;
   }
@@ -57,7 +56,8 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
 
   // --- Authenticated request ---
   if (method === 'GET' && (url === '/' || url === '')) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.end(`<!DOCTYPE html>
 <html lang="nl">
 <head>
@@ -96,12 +96,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
   }
 
   // --- 404 voor onbekende routes ---
-  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.statusCode = 404;
+  res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify({ error: 'Not found' }));
 }
-
-const server = createServer(handleRequest);
-
-server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});

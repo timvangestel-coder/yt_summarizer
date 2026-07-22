@@ -5,8 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js",
-    "dev": "tsx watch server.ts"
+    "dev": "vercel dev"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
