@@ -9,7 +9,7 @@ const APP_PASSWORD = process.env.APP_PASSWORD;
 const OPENCODE_API_KEY = process.env.OPENCODE_API_KEY;
 const OPENCODE_ENDPOINT = process.env.OPENCODE_ENDPOINT || 'https://opencode.ai/zen/v1/chat/completions';
 const OPENCODE_MODEL_ID = process.env.OPENCODE_MODEL_ID || 'deepseek-v4-flash-free';
-const DEEPSEEK_TIMEOUT = Number(process.env.DEEPSEEK_TIMEOUT) || 60000;
+const LLM_TIMEOUT = Number(process.env.LLM_TIMEOUT) || 60000;
 const TEST_PROMPT = process.env.TEST_PROMPT || 'Vat in één zin samen wat een REST API is.';
 
 // ── Logging helper ──────────────────────────────────────────────────
@@ -70,7 +70,7 @@ async function callDeepSeek(prompt: string): Promise<DeepSeekResult> {
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), DEEPSEEK_TIMEOUT);
+  const timeoutId = setTimeout(() => controller.abort(), LLM_TIMEOUT);
 
   try {
     const response = await fetch(OPENCODE_ENDPOINT, {
@@ -117,7 +117,7 @@ async function callDeepSeek(prompt: string): Promise<DeepSeekResult> {
   } catch (err: unknown) {
     // Timeout van AbortController
     if (err && typeof err === 'object' && 'name' in err && (err as any).name === 'AbortError') {
-      throw { category: 'timeout', message: `Het model reageerde niet binnen de time-out van ${DEEPSEEK_TIMEOUT / 1000} seconden.` } satisfies DeepSeekError;
+      throw { category: 'timeout', message: `Het model reageerde niet binnen de time-out van ${LLM_TIMEOUT / 1000} seconden.` } satisfies DeepSeekError;
     }
     // Als het al een DeepSeekError is, gooi opnieuw
     if (err && typeof err === 'object' && 'category' in err) {
