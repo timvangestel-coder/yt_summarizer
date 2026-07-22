@@ -289,31 +289,37 @@ async function getTranscript(videoId: string): Promise<TranscriptResult> {
 
   const resp = response as Record<string, unknown>;
 
-  // Controleer op error-response van InnerTube (IP-blokkade, rate-limit, etc.)
+  // Controleer op playabilityStatus (LOGIN_REQUIRED = IP-blokkade door cloudprovider)
+  const playabilityStatus = resp?.playabilityStatus as Record<string, unknown> | undefined;
+  const playabilityStatusText = playabilityStatus?.status as string | undefined;
+  console.error(`[transcript] InnerTube response for ${videoId}: playabilityStatus=${playabilityStatusText}`);
+
+  if (playabilityStatusText === 'LOGIN_REQUIRED' || playabilityStatusText === 'UNPLAYABLE') {
+    const errorScreen = playabilityStatus?.errorScreen as Record<string, unknown> | undefined;
+    const errorRenderer = errorScreen?.playerErrorMessageRenderer as Record<string, unknown> | undefined;
+    const reasonObj = errorRenderer?.reason as Record<string, unknown> | undefined;
+    const reasonRuns = reasonObj?.runs as Array<Record<string, unknown>> | undefined;
+    const reasonText = reasonRuns?.[0]?.text as string | undefined;
+    const reason = (playabilityStatus?.reason as string) || reasonText || 'Onbekende reden';
+    console.error(`[transcript] YouTube blokkade: ${reason}`);
+    throw new TranscriptError(
+      'YouTube blokkeert verzoeken vanuit deze cloudomgeving (Vercel/AWS). ' +
+      `Reden: ${reason}. ` +
+      'De InnerTube-Android-aanpak werkt niet vanaf cloudproviders. ' +
+      'Zie research/youtube-transcript-zonder-api.md voor details.',
+      503,
+      videoId,
+    );
+  }
+
+  // Controleer op error-response van InnerTube
   if (resp?.error && typeof resp.error === 'object') {
     const errObj = resp.error as Record<string, unknown>;
     const errMessage = String(errObj?.message || 'Onbekende fout van YouTube');
     const errCode = errObj?.code as number | undefined;
     console.error(`[transcript] InnerTube error for video ${videoId}: code=${errCode}, message="${errMessage}"`);
-    console.error(`[transcript] Full error response:`, JSON.stringify(resp.error));
-
-    if (errMessage.toLowerCase().includes('blocked') || errCode === 403) {
-      throw new TranscriptError(
-        'YouTube blokkeert verzoeken vanuit deze cloudomgeving (Vercel/AWS). ' +
-        'De InnerTube-Android-aanpak werkt niet vanaf hier. ' +
-        'Zie research/youtube-transcript-zonder-api.md voor details.',
-        503,
-        videoId,
-      );
-    }
     throw new TranscriptError(`YouTube InnerTube-fout: ${errMessage}`, 502, videoId);
   }
-
-  // Log de response-structuur voor diagnose (zonder de volledige body)
-  const hasCaptions = !!(resp?.captions);
-  const hasVideoDetails = !!(resp?.videoDetails);
-  const playabilityStatus = resp?.playabilityStatus as Record<string, unknown> | undefined;
-  console.error(`[transcript] InnerTube response for ${videoId}: hasCaptions=${hasCaptions}, hasVideoDetails=${hasVideoDetails}, playabilityStatus=${playabilityStatus?.status}`);
 
   const videoDetails = resp?.videoDetails as Record<string, unknown> | undefined;
   const title: string = (videoDetails?.title as string) || 'Onbekende titel';
@@ -324,9 +330,6 @@ async function getTranscript(videoId: string): Promise<TranscriptResult> {
 
   if (!captionTracksRaw || captionTracksRaw.length === 0) {
     console.error(`[transcript] No caption tracks for ${videoId}. Response keys: ${Object.keys(resp).join(', ')}`);
-    if (resp?.playabilityStatus) {
-      console.error(`[transcript] playabilityStatus:`, JSON.stringify(resp.playabilityStatus));
-    }
     throw new TranscriptError('Deze video heeft geen beschikbare ondertiteling.', 404, videoId);
   }
 
