@@ -272,6 +272,33 @@ async function getTranscript(videoId: string): Promise<TranscriptResult> {
   }
 
   const resp = response as Record<string, unknown>;
+
+  // Controleer op error-response van InnerTube (IP-blokkade, rate-limit, etc.)
+  if (resp?.error && typeof resp.error === 'object') {
+    const errObj = resp.error as Record<string, unknown>;
+    const errMessage = String(errObj?.message || 'Onbekende fout van YouTube');
+    const errCode = errObj?.code as number | undefined;
+    console.error(`[transcript] InnerTube error for video ${videoId}: code=${errCode}, message="${errMessage}"`);
+    console.error(`[transcript] Full error response:`, JSON.stringify(resp.error));
+
+    if (errMessage.toLowerCase().includes('blocked') || errCode === 403) {
+      throw new TranscriptError(
+        'YouTube blokkeert verzoeken vanuit deze cloudomgeving (Vercel/AWS). ' +
+        'De InnerTube-Android-aanpak werkt niet vanaf hier. ' +
+        'Zie research/youtube-transcript-zonder-api.md voor details.',
+        503,
+        videoId,
+      );
+    }
+    throw new TranscriptError(`YouTube InnerTube-fout: ${errMessage}`, 502, videoId);
+  }
+
+  // Log de response-structuur voor diagnose (zonder de volledige body)
+  const hasCaptions = !!(resp?.captions);
+  const hasVideoDetails = !!(resp?.videoDetails);
+  const playabilityStatus = resp?.playabilityStatus as Record<string, unknown> | undefined;
+  console.error(`[transcript] InnerTube response for ${videoId}: hasCaptions=${hasCaptions}, hasVideoDetails=${hasVideoDetails}, playabilityStatus=${playabilityStatus?.status}`);
+
   const videoDetails = resp?.videoDetails as Record<string, unknown> | undefined;
   const title: string = (videoDetails?.title as string) || 'Onbekende titel';
 
@@ -280,6 +307,10 @@ async function getTranscript(videoId: string): Promise<TranscriptResult> {
   const captionTracksRaw = tracklistRenderer?.captionTracks as Array<Record<string, unknown>> | undefined;
 
   if (!captionTracksRaw || captionTracksRaw.length === 0) {
+    console.error(`[transcript] No caption tracks for ${videoId}. Response keys: ${Object.keys(resp).join(', ')}`);
+    if (resp?.playabilityStatus) {
+      console.error(`[transcript] playabilityStatus:`, JSON.stringify(resp.playabilityStatus));
+    }
     throw new TranscriptError('Deze video heeft geen beschikbare ondertiteling.', 404, videoId);
   }
 
@@ -599,9 +630,17 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       res.writeHead(303, { Location: `/transcript?result=${encodedResult}&meta=${durationMs}` });
       res.end();
     } catch (err: unknown) {
-      const userMessage = err instanceof TranscriptError ? err.message : 'Er is een onbekende fout opgetreden bij het ophalen van het transcript.';
-      const encodedError = encodeURIComponent(userMessage);
-      res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
+      const durationMs = Date.now() - startTime;
+      if (err instanceof TranscriptError) {
+        console.error(`[transcript] Error for ${TRANSCRIPT_VIDEO_ID} after ${durationMs}ms: ${err.name} (${err.statusCode}): ${err.message}`);
+        const userMessage = err.message;
+        const encodedError = encodeURIComponent(userMessage);
+        res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
+      } else {
+        console.error(`[transcript] Unexpected error for ${TRANSCRIPT_VIDEO_ID} after ${durationMs}ms:`, err);
+        const encodedError = encodeURIComponent('Er is een onbekende fout opgetreden bij het ophalen van het transcript.');
+        res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
+      }
       res.end();
     }
     return;
