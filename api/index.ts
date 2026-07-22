@@ -12,6 +12,7 @@ const OPENCODE_MODEL_ID = process.env.OPENCODE_MODEL_ID || 'deepseek-v4-flash-fr
 const LLM_TIMEOUT_SECONDS = Number(process.env.LLM_TIMEOUT) || 60;
 const LLM_TIMEOUT_MS = LLM_TIMEOUT_SECONDS * 1000;
 const TEST_PROMPT = process.env.TEST_PROMPT || 'Vat in één zin samen wat een REST API is.';
+const MAX_RESULT_URL_LENGTH = 1500; // max chars voor result in query parameter
 
 // ── Logging helper ──────────────────────────────────────────────────
 interface LogEntry {
@@ -243,8 +244,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   // --- Test-prompt formulier (GET) ---
   if (method === 'GET' && pathname === '/test-prompt') {
+    const parsedUrl = new URL(url, 'http://localhost');
+    const errorParam = parsedUrl.searchParams.get('error') || undefined;
+    const resultParam = parsedUrl.searchParams.get('result') || undefined;
+    const metaParam = parsedUrl.searchParams.get('meta') || undefined;
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderFormPage());
+    res.end(renderFormPage(errorParam, resultParam, metaParam));
     return;
   }
 
@@ -273,8 +278,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       });
 
       const meta = `Model: ${OPENCODE_MODEL_ID} · Duur: ${durationMs}ms · Tokens: ${result.tokenUsage.total} (${result.tokenUsage.prompt} in / ${result.tokenUsage.completion} uit)`;
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderFormPage(undefined, result.content, meta));
+      let displayResult = result.content;
+      if (displayResult.length > MAX_RESULT_URL_LENGTH) {
+        displayResult = displayResult.slice(0, MAX_RESULT_URL_LENGTH) + '\n\n... (antwoord ingekort voor weergave)';
+      }
+      const encodedResult = encodeURIComponent(displayResult);
+      const encodedMeta = encodeURIComponent(meta);
+      res.writeHead(303, { Location: `/test-prompt?result=${encodedResult}&meta=${encodedMeta}` });
+      res.end();
     } catch (err: unknown) {
       const durationMs = Date.now() - startTime;
       const deepSeekErr = err as DeepSeekError;
@@ -291,8 +302,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       });
 
       const userMessage = deepSeekErr.message || 'Er is een onbekende fout opgetreden.';
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderFormPage(userMessage));
+      const encodedError = encodeURIComponent(userMessage);
+      res.writeHead(303, { Location: `/test-prompt?error=${encodedError}` });
+      res.end();
     }
     return;
   }
