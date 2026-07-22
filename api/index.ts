@@ -3,6 +3,7 @@
  * Alle routes worden via rewrites in vercel.json naar deze functie gestuurd.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import * as https from 'node:https';
 
 // ── Environment variables ───────────────────────────────────────────
 const APP_PASSWORD = process.env.APP_PASSWORD;
@@ -13,6 +14,7 @@ const LLM_TIMEOUT_SECONDS = Number(process.env.LLM_TIMEOUT) || 60;
 const LLM_TIMEOUT_MS = LLM_TIMEOUT_SECONDS * 1000;
 const TEST_PROMPT = process.env.TEST_PROMPT || 'Vat in één zin samen wat een REST API is.';
 const MAX_RESULT_URL_LENGTH = 1500; // max chars voor result in query parameter
+const TRANSCRIPT_VIDEO_ID = process.env.TRANSCRIPT_VIDEO_ID || 'jNQXAC9IVRw';
 
 // ── Logging helper ──────────────────────────────────────────────────
 interface LogEntry {
@@ -132,6 +134,179 @@ async function callDeepSeek(prompt: string): Promise<DeepSeekResult> {
   }
 }
 
+// ── YouTube Transcript helpers ──────────────────────────────────────
+
+interface TranscriptSnippet {
+  text: string;
+  start: number;
+  duration: number;
+}
+
+interface TranscriptResult {
+  videoId: string;
+  title: string;
+  language: string;
+  snippets: TranscriptSnippet[];
+  fullText: string;
+}
+
+class TranscriptError extends Error {
+  statusCode: number;
+  videoId: string;
+  constructor(message: string, statusCode: number, videoId: string) {
+    super(message);
+    this.name = 'TranscriptError';
+    this.statusCode = statusCode;
+    this.videoId = videoId;
+  }
+}
+
+function httpsPostJson(url: string, body: unknown): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const jsonBody = JSON.stringify(body);
+    const options: https.RequestOptions = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Length': Buffer.byteLength(jsonBody),
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        'Accept': 'application/json',
+      },
+    };
+    const req = https.request(options, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf-8');
+        try { resolve(JSON.parse(raw)); }
+        catch { reject(new Error(`Ongeldige JSON-response (HTTP ${res.statusCode})`)); }
+      });
+    });
+    req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
+    req.write(jsonBody);
+    req.end();
+  });
+}
+
+function httpsGet(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const options: https.RequestOptions = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        'Accept': 'text/xml, application/xml, */*',
+      },
+    };
+    const req = https.request(options, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        if (res.statusCode && res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode} bij ophalen timedtext`));
+          return;
+        }
+        resolve(Buffer.concat(chunks).toString('utf-8'));
+      });
+    });
+    req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
+    req.end();
+  });
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, '/');
+}
+
+function parseTimedtextXml(xml: string): TranscriptSnippet[] {
+  const snippets: TranscriptSnippet[] = [];
+  const srv3Regex = /<p\s+t="([^"]*)"\s+d="([^"]*)"[^>]*>([\s\S]*?)<\/p>/g;
+  let srv3Match;
+  let hasSrv3 = false;
+  while ((srv3Match = srv3Regex.exec(xml)) !== null) {
+    hasSrv3 = true;
+    const innerText = srv3Match[3].replace(/<[^>]+>/g, '').trim();
+    snippets.push({
+      text: decodeHtmlEntities(innerText),
+      start: parseFloat(srv3Match[1]) / 1000,
+      duration: parseFloat(srv3Match[2]) / 1000,
+    });
+  }
+  if (!hasSrv3) {
+    const textRegex = /<text start="([^"]+)" dur="([^"]*)">([^<]*)<\/text>/g;
+    let match;
+    while ((match = textRegex.exec(xml)) !== null) {
+      snippets.push({
+        text: decodeHtmlEntities(match[3]),
+        start: parseFloat(match[1]),
+        duration: match[2] ? parseFloat(match[2]) : 0,
+      });
+    }
+  }
+  return snippets;
+}
+
+async function getTranscript(videoId: string): Promise<TranscriptResult> {
+  const innerTubeBody = {
+    context: { client: { clientName: 'ANDROID', clientVersion: '20.10.38' } },
+    videoId,
+  };
+
+  let response: unknown;
+  try {
+    response = await httpsPostJson('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', innerTubeBody);
+  } catch (err) {
+    throw new TranscriptError(`Interne fout bij ophalen ondertiteling: ${err instanceof Error ? err.message : 'Onbekende fout'}`, 502, videoId);
+  }
+
+  const resp = response as Record<string, unknown>;
+  const videoDetails = resp?.videoDetails as Record<string, unknown> | undefined;
+  const title: string = (videoDetails?.title as string) || 'Onbekende titel';
+
+  const captions = resp?.captions as Record<string, unknown> | undefined;
+  const tracklistRenderer = captions?.playerCaptionsTracklistRenderer as Record<string, unknown> | undefined;
+  const captionTracksRaw = tracklistRenderer?.captionTracks as Array<Record<string, unknown>> | undefined;
+
+  if (!captionTracksRaw || captionTracksRaw.length === 0) {
+    throw new TranscriptError('Deze video heeft geen beschikbare ondertiteling.', 404, videoId);
+  }
+
+  // Kies beste taal: NL > EN > eerste
+  let selectedTrack = captionTracksRaw.find((t) => t.languageCode === 'nl');
+  if (!selectedTrack) selectedTrack = captionTracksRaw.find((t) => t.languageCode === 'en');
+  if (!selectedTrack) selectedTrack = captionTracksRaw[0];
+
+  const baseUrl = selectedTrack.baseUrl as string;
+  const language = selectedTrack.languageCode as string;
+
+  let xml: string;
+  try {
+    xml = await httpsGet(baseUrl);
+  } catch (err) {
+    throw new TranscriptError(`Fout bij ophalen ondertiteling: ${err instanceof Error ? err.message : 'Onbekende fout'}`, 502, videoId);
+  }
+
+  const snippets = parseTimedtextXml(xml);
+  if (snippets.length === 0) {
+    throw new TranscriptError('Deze video heeft geen beschikbare ondertiteling.', 404, videoId);
+  }
+
+  const fullText = snippets.map((s) => s.text).join(' ');
+  return { videoId, title, language, snippets, fullText };
+}
+
 // ── HTML templates ──────────────────────────────────────────────────
 const PAGE_STYLE = `
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -206,6 +381,80 @@ function renderFormPage(error?: string, result?: string, meta?: string): string 
       const btn = document.getElementById('submit-btn');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span> Bezig met verwerken...';
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function renderTranscriptPage(error?: string, result?: TranscriptResult, durationMs?: number): string {
+  const snippetsHtml = result?.snippets.map((s, i) =>
+    `<tr>
+      <td style="padding:0.25rem 0.5rem;color:#64748b;white-space:nowrap;font-size:0.85rem;">${s.start.toFixed(1)}s</td>
+      <td style="padding:0.25rem 0.5rem;color:#e2e8f0;">${escapeHtml(s.text)}</td>
+    </tr>`
+  ).join('') || '';
+
+  return `<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Transcript — Cloud AI POC</title>
+  <style>${PAGE_STYLE}
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+    tr:nth-child(even) { background: #0f172a; }
+    .video-meta { font-size: 0.85rem; color: #94a3b8; margin-top: 0.5rem; }
+    .fulltext-box { max-height: 300px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <div class="card" style="max-width: 800px;">
+    <h1>🎬 YouTube Transcript</h1>
+    <p>Haal de ondertiteling op van een bekende YouTube-video via de InnerTube API.</p>
+
+    <form method="POST" action="/transcript" id="transcript-form">
+      <button type="submit" id="submit-btn">📥 Haal transcript op van voorbeeldvideo</button>
+    </form>
+
+    ${error ? `<div class="result"><p style="color:#ef4444;">❌ Fout</p><div class="result-box error-box">${escapeHtml(error)}</div></div>` : ''}
+
+    ${result ? `
+    <div class="result">
+      <p style="color:#22c55e;">✅ Transcript opgehaald</p>
+      <div class="video-meta">
+        <strong>Titel:</strong> ${escapeHtml(result.title)}<br>
+        <strong>Video ID:</strong> ${result.videoId}<br>
+        <strong>Taal:</strong> ${result.language}<br>
+        <strong>Aantal snippets:</strong> ${result.snippets.length}<br>
+        <strong>Doorlooptijd:</strong> ${durationMs}ms
+      </div>
+      <p style="margin-top:1rem;font-weight:600;">Volledige tekst</p>
+      <div class="result-box fulltext-box">${escapeHtml(result.fullText)}</div>
+      <p style="margin-top:1rem;font-weight:600;">Snippets (tijd + tekst)</p>
+      <div class="result-box" style="padding:0;overflow-x:auto;">
+        <table>
+          <thead>
+            <tr style="background:#1e293b;">
+              <th style="padding:0.5rem;text-align:left;color:#94a3b8;font-size:0.85rem;">Tijd</th>
+              <th style="padding:0.5rem;text-align:left;color:#94a3b8;font-size:0.85rem;">Tekst</th>
+            </tr>
+          </thead>
+          <tbody>${snippetsHtml}</tbody>
+        </table>
+      </div>
+    </div>
+    ` : ''}
+
+    <div class="badge">Protected by HTTP Basic Auth</div>
+    <p style="margin-top:1rem;text-align:center;"><a href="/" style="color:#3b82f6;">← Terug naar home</a></p>
+  </div>
+
+  <script>
+    document.getElementById('transcript-form')?.addEventListener('submit', function(e) {
+      const btn = document.getElementById('submit-btn');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Bezig met ophalen transcript...';
     });
   </script>
 </body>
@@ -309,6 +558,55 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // --- Transcript pagina (GET) ---
+  if (method === 'GET' && pathname === '/transcript') {
+    const parsedUrl = new URL(url, 'http://localhost');
+    const errorParam = parsedUrl.searchParams.get('error') || undefined;
+    const resultParam = parsedUrl.searchParams.get('result') || undefined;
+    const metaParam = parsedUrl.searchParams.get('meta') || undefined;
+
+    if (resultParam) {
+      try {
+        const parsed = JSON.parse(decodeURIComponent(resultParam));
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderTranscriptPage(undefined, parsed, metaParam ? Number(metaParam) : undefined));
+        return;
+      } catch { /* fall through to empty form */ }
+    }
+
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderTranscriptPage(errorParam));
+    return;
+  }
+
+  // --- Transcript ophalen (POST) ---
+  if (method === 'POST' && pathname === '/transcript') {
+    const startTime = Date.now();
+
+    try {
+      const result = await getTranscript(TRANSCRIPT_VIDEO_ID);
+      const durationMs = Date.now() - startTime;
+
+      // Beperk fullText lengte voor URL parameter
+      const resultForUrl = {
+        ...result,
+        fullText: result.fullText.length > MAX_RESULT_URL_LENGTH
+          ? result.fullText.slice(0, MAX_RESULT_URL_LENGTH) + '\n\n... (tekst ingekort voor weergave)'
+          : result.fullText,
+      };
+
+      const encodedResult = encodeURIComponent(JSON.stringify(resultForUrl));
+      res.writeHead(303, { Location: `/transcript?result=${encodedResult}&meta=${durationMs}` });
+      res.end();
+    } catch (err: unknown) {
+      const userMessage = err instanceof TranscriptError ? err.message : 'Er is een onbekende fout opgetreden bij het ophalen van het transcript.';
+      const encodedError = encodeURIComponent(userMessage);
+      res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
+      res.end();
+    }
+    return;
+  }
+
   // --- Root pagina (beveiligd) ---
   if (method === 'GET' && (pathname === '/' || pathname === '')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -325,6 +623,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     <h1>✅ Cloud AI POC</h1>
     <p>De beveiligde POC-webapp draait op Vercel. Basic Auth is actief.</p>
     <p style="margin-top:1rem;"><a href="/test-prompt" style="color:#3b82f6;">🧪 Test de DeepSeek-koppeling →</a></p>
+    <p style="margin-top:0.5rem;"><a href="/transcript" style="color:#3b82f6;">🎬 YouTube Transcript ophalen →</a></p>
     <div class="badge">Protected by HTTP Basic Auth</div>
   </div>
 </body>
