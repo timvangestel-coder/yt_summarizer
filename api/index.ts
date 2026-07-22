@@ -1,14 +1,18 @@
 /**
- * Vercel Serverless Function — vervangt de server capture aanpak.
+ * Vercel Serverless Function — Node.js (req, res) pattern.
  * Alle routes worden via rewrites in vercel.json naar deze functie gestuurd.
  */
+import type { IncomingMessage, ServerResponse } from 'node:http';
+
 const APP_PASSWORD = process.env.APP_PASSWORD;
 
 /** Parse Basic Auth credentials uit de Authorization header. */
-function parseBasicAuth(authHeader: string | null): string | null {
-  if (!authHeader || !authHeader.startsWith('Basic ')) return null;
+function parseBasicAuth(headers: IncomingMessage['headers']): string | null {
+  const auth = headers['authorization'];
+  if (!auth || typeof auth !== 'string') return null;
+  if (!auth.startsWith('Basic ')) return null;
   try {
-    const base64 = authHeader.slice(6);
+    const base64 = auth.slice(6);
     const decoded = Buffer.from(base64, 'base64').toString('utf-8');
     const colonIndex = decoded.indexOf(':');
     if (colonIndex === -1) return null;
@@ -18,43 +22,45 @@ function parseBasicAuth(authHeader: string | null): string | null {
   }
 }
 
-export default function handler(
-  request: Request,
-): Response {
-  const url = new URL(request.url);
-  const method = request.method || 'GET';
+/** Stuur een 401-response die de browser Basic Auth-dialog triggert. */
+function requireAuth(res: ServerResponse): void {
+  res.writeHead(401, {
+    'WWW-Authenticate': 'Basic realm="Cloud AI POC", charset="UTF-8"',
+    'Content-Type': 'application/json',
+  });
+  res.end(JSON.stringify({ error: 'Authorization required' }));
+}
+
+/** Verwerk een inkomend verzoek. */
+function handleRequest(req: IncomingMessage, res: ServerResponse): void {
+  const url = req.url || '/';
+  const method = req.method || 'GET';
+  const pathname = url.split('?')[0]; // strip query params
 
   // --- Healthcheck (openbaar) ---
-  if (method === 'GET' && url.pathname === '/health') {
-    return new Response(JSON.stringify({ status: 'ok' }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
+  if (method === 'GET' && pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok' }));
+    return;
   }
 
   // --- Alle andere routes vereisen authenticatie ---
   if (!APP_PASSWORD) {
-    return new Response(JSON.stringify({ error: 'APP_PASSWORD not configured' }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'APP_PASSWORD not configured' }));
+    return;
   }
 
-  const providedPassword = parseBasicAuth(request.headers.get('authorization'));
+  const providedPassword = parseBasicAuth(req.headers);
   if (providedPassword !== APP_PASSWORD) {
-    return new Response(JSON.stringify({ error: 'Authorization required' }), {
-      status: 401,
-      headers: {
-        'Content-Type': 'application/json',
-        'WWW-Authenticate': 'Basic realm="Cloud AI POC", charset="UTF-8"',
-      },
-    });
+    requireAuth(res);
+    return;
   }
 
   // --- Root pagina (beveiligd) ---
-  if (method === 'GET' && (url.pathname === '/' || url.pathname === '')) {
-    return new Response(
-      `<!DOCTYPE html>
+  if (method === 'GET' && (pathname === '/' || pathname === '')) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!DOCTYPE html>
 <html lang="nl">
 <head>
   <meta charset="UTF-8">
@@ -87,17 +93,22 @@ export default function handler(
     <div class="badge">Protected by HTTP Basic Auth</div>
   </div>
 </body>
-</html>`,
-      {
-        status: 200,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      },
-    );
+</html>`);
+    return;
   }
 
   // --- 404 voor onbekende routes ---
-  return new Response(JSON.stringify({ error: 'Not found' }), {
-    status: 404,
-    headers: { 'Content-Type': 'application/json' },
-  });
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+}
+
+/** Vercel entrypoint — Node.js (req, res) pattern. */
+export default function handler(req: IncomingMessage, res: ServerResponse): void {
+  try {
+    handleRequest(req, res);
+  } catch (err) {
+    console.error('Unhandled error:', err);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Internal server error' }));
+  }
 }
