@@ -10,6 +10,7 @@
   "outputDirectory": "dist",
   "framework": null,
   "rewrites": [
+    { "source": "/transcript", "destination": "/api/transcript" },
     { "source": "/(.*)", "destination": "/api/index" }
   ]
 }
