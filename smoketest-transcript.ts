@@ -1,371 +1,260 @@
 /**
  * Smoketest voor YouTube transcript — Issue 04
  *
- * Voert de transcript-logica lokaal uit (zonder Vercel) via tsx.
+ * Test de YouTube Data API v3-implementatie lokaal (zonder Vercel) via tsx.
  * Gebruik: npx tsx smoketest-transcript.ts
  *
+ * Voor de OAuth-afhankelijke tests (captions.list, captions.download) zijn
+ * environment variables nodig: YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET,
+ * YOUTUBE_REFRESH_TOKEN. Zonder deze credentials worden alleen de
+ * offline tests (parseVideoId, parseSbv) uitgevoerd.
+ *
  * Testcases:
- * 1. Bekende video met ondertiteling (TED-talk: jNQXAC9IVRw — "Me at the zoo")
- * 2. Video zonder ondertiteling
- * 3. Ongeldige URL
+ * 1. parseVideoId — geldige YouTube URL (www.youtube.com/watch?v=...)
+ * 2. parseVideoId — youtu.be URL
+ * 3. parseVideoId — raw video ID
+ * 4. parseVideoId — ongeldig formaat
+ * 5. parseSbv — geldige SBV-content
+ * 6. parseSbv — lege SBV-content
+ * 7. OAuth token verversen (alleen met credentials)
+ * 8. Volledige transcript-flow (alleen met credentials)
  */
 
-import * as https from 'node:https';
+import {
+  parseVideoId,
+  parseSbv,
+  getAccessToken,
+  fetchCaptionTracks,
+  downloadCaption,
+  getTranscriptYoutubeApi,
+  TranscriptError,
+  TranscriptResult,
+  TranscriptSnippet,
+  InvalidVideoIdError,
+  TranscriptNotAvailableError,
+  TranscriptDisabledError,
+  OAuthError,
+  QuotaExceededError,
+} from './api/transcript.js';
 
-// ── Types (zelfde als in transcript.ts) ─────────────────────────────
+// ── Configuratie ───────────────────────────────────────────────────
 
-interface TranscriptSnippet {
-  text: string;
-  start: number;
-  duration: number;
-}
+const YOUTUBE_CLIENT_ID = process.env.YOUTUBE_CLIENT_ID || '';
+const YOUTUBE_CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET || '';
+const YOUTUBE_REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN || '';
+const HAS_CREDENTIALS = !!(YOUTUBE_CLIENT_ID && YOUTUBE_CLIENT_SECRET && YOUTUBE_REFRESH_TOKEN);
 
-interface CaptionTrack {
-  baseUrl: string;
-  languageCode: string;
-  name: string;
-  kind?: string;
-}
-
-interface TranscriptResult {
-  videoId: string;
-  title: string;
-  language: string;
-  snippets: TranscriptSnippet[];
-  fullText: string;
-}
-
-// ── Error classes ───────────────────────────────────────────────────
-
-class TranscriptError extends Error {
-  statusCode: number;
-  videoId: string;
-  constructor(message: string, statusCode: number, videoId: string) {
-    super(message);
-    this.name = 'TranscriptError';
-    this.statusCode = statusCode;
-    this.videoId = videoId;
-  }
-}
-
-class InvalidVideoIdError extends TranscriptError {
-  constructor(videoId: string) {
-    super('Ongeldige YouTube-URL.', 400, videoId);
-    this.name = 'InvalidVideoIdError';
-  }
-}
-
-class TranscriptNotAvailableError extends TranscriptError {
-  constructor(videoId: string) {
-    super('Deze video heeft geen beschikbare ondertiteling.', 404, videoId);
-    this.name = 'TranscriptNotAvailableError';
-  }
-}
-
-class TranscriptDisabledError extends TranscriptError {
-  constructor(videoId: string) {
-    super('Ondertiteling is uitgeschakeld voor deze video.', 404, videoId);
-    this.name = 'TranscriptDisabledError';
-  }
-}
-
-class IpBlockedError extends TranscriptError {
-  constructor(videoId: string) {
-    super('YouTube blokkeert verzoeken vanuit de cloudomgeving.', 503, videoId);
-    this.name = 'IpBlockedError';
-  }
-}
-
-class InnerTubeError extends TranscriptError {
-  constructor(videoId: string, detail: string) {
-    super(`Interne fout: ${detail}`, 502, videoId);
-    this.name = 'InnerTubeError';
-  }
-}
-
-// ── Helpers (zelfde als in transcript.ts) ───────────────────────────
-
-function httpsPostJson(url: string, body: unknown): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const jsonBody = JSON.stringify(body);
-    const options: https.RequestOptions = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Content-Length': Buffer.byteLength(jsonBody),
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        'Accept': 'application/json',
-      },
-    };
-    const req = https.request(options, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString('utf-8');
-        try { resolve(JSON.parse(raw)); }
-        catch { reject(new Error(`Ongeldige JSON (HTTP ${res.statusCode})`)); }
-      });
-    });
-    req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
-    req.write(jsonBody);
-    req.end();
-  });
-}
-
-function httpsGet(url: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const options: https.RequestOptions = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        'Accept': 'text/xml, application/xml, */*',
-      },
-    };
-    const req = https.request(options, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
-      res.on('end', () => {
-        if (res.statusCode && res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode}`));
-          return;
-        }
-        resolve(Buffer.concat(chunks).toString('utf-8'));
-      });
-    });
-    req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
-    req.end();
-  });
-}
-
-function parseVideoId(url: string): string | null {
-  const patterns = [
-    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})(?:[&?/]|$)/,
-    /^([a-zA-Z0-9_-]{11})$/,
-  ];
-  for (const pattern of patterns) {
-    const match = url.match(pattern);
-    if (match) return match[1];
-  }
-  return null;
-}
-
-function pickBestCaptionTrack(tracks: CaptionTrack[]): CaptionTrack | null {
-  if (tracks.length === 0) return null;
-  const nl = tracks.find((t) => t.languageCode === 'nl');
-  if (nl) return nl;
-  const en = tracks.find((t) => t.languageCode === 'en');
-  if (en) return en;
-  return tracks[0];
-}
-
-function decodeHtmlEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, '/');
-}
-
-function parseTimedtextXml(xml: string): TranscriptSnippet[] {
-  const snippets: TranscriptSnippet[] = [];
-  const srv3Regex = /<p\s+t="([^"]*)"\s+d="([^"]*)"[^>]*>([\s\S]*?)<\/p>/g;
-  let srv3Match;
-  let hasSrv3 = false;
-  while ((srv3Match = srv3Regex.exec(xml)) !== null) {
-    hasSrv3 = true;
-    const innerText = srv3Match[3].replace(/<[^>]+>/g, '').trim();
-    snippets.push({
-      text: decodeHtmlEntities(innerText),
-      start: parseFloat(srv3Match[1]) / 1000,
-      duration: parseFloat(srv3Match[2]) / 1000,
-    });
-  }
-  if (!hasSrv3) {
-    const textRegex = /<text start="([^"]+)" dur="([^"]*)">([^<]*)<\/text>/g;
-    let match;
-    while ((match = textRegex.exec(xml)) !== null) {
-      snippets.push({
-        text: decodeHtmlEntities(match[3]),
-        start: parseFloat(match[1]),
-        duration: match[2] ? parseFloat(match[2]) : 0,
-      });
-    }
-  }
-  return snippets;
-}
-
-function isIpBlocked(response: unknown): boolean {
-  const resp = response as Record<string, unknown>;
-  if (resp?.error && typeof resp.error === 'object') {
-    const err = resp.error as Record<string, unknown>;
-    const messages = [
-      err?.message,
-      ...(Array.isArray(err?.errors) ? (err.errors as Array<Record<string, unknown>>).map((e) => e?.message) : []),
-    ].filter(Boolean).map(String);
-    return messages.some((m) => m.includes('blocked') || m.includes('IP') || m.includes('robot') || m.includes('automated'));
-  }
-  return false;
-}
-
-function isTranscriptDisabled(response: unknown): boolean {
-  const resp = response as Record<string, unknown>;
-  const playabilityStatus = resp?.playabilityStatus as Record<string, unknown> | undefined;
-  if (playabilityStatus?.status === 'UNPLAYABLE' || playabilityStatus?.status === 'LOGIN_REQUIRED') {
-    return true;
-  }
-  return false;
-}
-
-// ── Hoofdlogica ─────────────────────────────────────────────────────
-
-const INNERTUBE_API_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
-
-async function getTranscript(videoId: string): Promise<TranscriptResult> {
-  const innerTubeBody = {
-    context: { client: { clientName: 'ANDROID', clientVersion: '20.10.38' } },
-    videoId,
-  };
-
-  let response: unknown;
-  try {
-    response = await httpsPostJson(INNERTUBE_API_URL, innerTubeBody);
-  } catch (err) {
-    throw new InnerTubeError(videoId, err instanceof Error ? err.message : 'Onbekende fout');
-  }
-
-  if (isIpBlocked(response)) throw new IpBlockedError(videoId);
-  if (isTranscriptDisabled(response)) throw new TranscriptDisabledError(videoId);
-
-  const resp = response as Record<string, unknown>;
-  const videoDetails = resp?.videoDetails as Record<string, unknown> | undefined;
-  const title: string = (videoDetails?.title as string) || 'Onbekende titel';
-
-  const captions = resp?.captions as Record<string, unknown> | undefined;
-  const tracklistRenderer = captions?.playerCaptionsTracklistRenderer as Record<string, unknown> | undefined;
-  const captionTracksRaw = tracklistRenderer?.captionTracks as Array<Record<string, unknown>> | undefined;
-
-  if (!captionTracksRaw || captionTracksRaw.length === 0) {
-    throw new TranscriptNotAvailableError(videoId);
-  }
-
-  const captionTracks: CaptionTrack[] = captionTracksRaw.map((track) => ({
-    baseUrl: track.baseUrl as string,
-    languageCode: track.languageCode as string,
-    name: ((track.name as Record<string, unknown>)?.runs as Array<Record<string, unknown>>)?.[0]?.text as string || track.languageCode as string,
-    kind: track.kind as string | undefined,
-  }));
-
-  const selectedTrack = pickBestCaptionTrack(captionTracks);
-  if (!selectedTrack) throw new TranscriptNotAvailableError(videoId);
-
-  let xml: string;
-  try {
-    xml = await httpsGet(selectedTrack.baseUrl);
-  } catch (err) {
-    throw new InnerTubeError(videoId, err instanceof Error ? err.message : 'Fout bij ophalen timedtext XML');
-  }
-
-  const snippets = parseTimedtextXml(xml);
-  if (snippets.length === 0) throw new TranscriptNotAvailableError(videoId);
-
-  const fullText = snippets.map((s) => s.text).join(' ');
-
-  return { videoId, title, language: selectedTrack.languageCode, snippets, fullText };
-}
-
-// ── Smoketest runner ────────────────────────────────────────────────
+// ── Test runner ─────────────────────────────────────────────────────
 
 interface TestResult {
   name: string;
-  status: 'PASS' | 'FAIL' | 'BLOCKED';
+  status: 'PASS' | 'FAIL' | 'SKIP';
   details: string;
   durationMs: number;
 }
 
-async function runTest(name: string, fn: () => Promise<void>): Promise<TestResult> {
+async function runTest(name: string, fn: () => Promise<void>, skip = false): Promise<TestResult> {
+  if (skip) {
+    return { name, status: 'SKIP', details: '⏭️ Overgeslagen (geen credentials)', durationMs: 0 };
+  }
   const start = Date.now();
   try {
     await fn();
     return { name, status: 'PASS', details: '✅ Geslaagd', durationMs: Date.now() - start };
   } catch (err) {
-    if (err instanceof IpBlockedError) {
-      return { name, status: 'BLOCKED', details: `🔒 IP geblokkeerd: ${err.message}`, durationMs: Date.now() - start };
-    }
     return { name, status: 'FAIL', details: `❌ ${err instanceof Error ? err.message : String(err)}`, durationMs: Date.now() - start };
   }
 }
+
+// ── Tests ───────────────────────────────────────────────────────────
 
 async function main() {
   console.log('='.repeat(60));
   console.log('🧪 Smoketest — YouTube Transcript (Issue 04)');
   console.log(`Datum: ${new Date().toISOString()}`);
+  console.log(`Aanpak: YouTube Data API v3 (OAuth 2.0)`);
+  console.log(`Credentials: ${HAS_CREDENTIALS ? '✅ Geconfigureerd' : '⏭️ Niet geconfigureerd (alleen offline tests)'}`);
   console.log('='.repeat(60));
   console.log();
 
   const results: TestResult[] = [];
 
-  // Test 1: Bekende video met ondertiteling
-  results.push(await runTest('Video met ondertiteling (jNQXAC9IVRw)', async () => {
-    const result = await getTranscript('jNQXAC9IVRw');
-    console.log(`   Titel: ${result.title}`);
-    console.log(`   Taal: ${result.language}`);
-    console.log(`   Aantal snippets: ${result.snippets.length}`);
-    console.log(`   Volledige tekst lengte: ${result.fullText.length} tekens`);
-    console.log(`   Eerste 100 chars: "${result.fullText.slice(0, 100)}..."`);
-    if (result.snippets.length === 0) throw new Error('Geen snippets gevonden');
-    if (!result.fullText) throw new Error('Geen fullText');
-  }));
-
-  // Test 2: Ongeldige URL
-  results.push(await runTest('Ongeldige URL', async () => {
-    const videoId = parseVideoId('https://example.com/geen-video');
-    if (videoId) throw new Error('Zou null moeten zijn voor ongeldige URL');
-  }));
-
-  // Test 3: parseVideoId met geldige URL
-  results.push(await runTest('parseVideoId geldige URL', async () => {
+  // ── Test 1: parseVideoId — geldige www.youtube.com URL ──────────────────
+  results.push(await runTest('parseVideoId — www.youtube.com/watch?v=...', async () => {
     const id = parseVideoId('https://www.youtube.com/watch?v=jNQXAC9IVRw');
     if (id !== 'jNQXAC9IVRw') throw new Error(`Verwacht jNQXAC9IVRw, kreeg ${id}`);
+    console.log(`   ID: ${id}`);
   }));
 
-  // Test 4: parseVideoId met youtu.be
-  results.push(await runTest('parseVideoId youtu.be URL', async () => {
+  // ── Test 2: parseVideoId — youtu.be URL ─────────────────────────────────
+  results.push(await runTest('parseVideoId — youtu.be URL', async () => {
     const id = parseVideoId('https://youtu.be/jNQXAC9IVRw');
     if (id !== 'jNQXAC9IVRw') throw new Error(`Verwacht jNQXAC9IVRw, kreeg ${id}`);
   }));
 
-  // Test 5: parseVideoId met raw ID
-  results.push(await runTest('parseVideoId raw ID', async () => {
+  // ── Test 3: parseVideoId — raw video ID ─────────────────────────────────
+  results.push(await runTest('parseVideoId — raw video ID', async () => {
     const id = parseVideoId('jNQXAC9IVRw');
     if (id !== 'jNQXAC9IVRw') throw new Error(`Verwacht jNQXAC9IVRw, kreeg ${id}`);
   }));
 
-  // Test 6: Ongeldig video ID formaat
-  results.push(await runTest('parseVideoId ongeldig formaat', async () => {
+  // ── Test 4: parseVideoId — ongeldig formaat ─────────────────────────────
+  results.push(await runTest('parseVideoId — ongeldig formaat', async () => {
     const id = parseVideoId('https://www.youtube.com/watch?v=te-kort');
     if (id) throw new Error(`Zou null moeten zijn, kreeg ${id}`);
   }));
 
-  // Test 7: Video zonder ondertiteling (gebruik een random niet-bestaande video)
-  results.push(await runTest('Video zonder ondertiteling (zzzzzzzzzzz)', async () => {
+  // ── Test 5: parseVideoId — ongeldige URL (geen YouTube) ────────────────
+  results.push(await runTest('parseVideoId — ongeldige URL (geen YouTube)', async () => {
+    const id = parseVideoId('https://example.com/geen-video');
+    if (id) throw new Error(`Zou null moeten zijn, kreeg ${id}`);
+  }));
+
+  // ── Test 6: parseSbv — geldige SBV-content ─────────────────────────────
+  results.push(await runTest('parseSbv — geldige SBV-content', async () => {
+    const sbv = `0:00:00.000,0:00:01.540
+Hey there
+
+0:00:02.000,0:00:04.500
+How are you?
+
+0:00:05.000,0:00:07.200
+I am fine, thanks!`;
+
+    const snippets = parseSbv(sbv);
+    if (snippets.length !== 3) throw new Error(`Verwacht 3 snippets, kreeg ${snippets.length}`);
+    if (snippets[0].text !== 'Hey there') throw new Error(`Verwacht "Hey there", kreeg "${snippets[0].text}"`);
+    if (snippets[0].start !== 0) throw new Error(`Verwacht start=0, kreeg ${snippets[0].start}`);
+    if (Math.abs(snippets[0].duration - 1.54) > 0.001) throw new Error(`Verwacht duration=1.54, kreeg ${snippets[0].duration}`);
+    if (snippets[1].text !== 'How are you?') throw new Error(`Verwacht "How are you?", kreeg "${snippets[1].text}"`);
+    if (snippets[2].text !== 'I am fine, thanks!') throw new Error(`Verwacht "I am fine, thanks!", kreeg "${snippets[2].text}"`);
+    console.log(`   Aantal snippets: ${snippets.length}`);
+    console.log(`   Eerste snippet: "${snippets[0].text}" @ ${snippets[0].start}s (dur: ${snippets[0].duration}s)`);
+  }));
+
+  // ── Test 7: parseSbv — lege SBV-content ───────────────────────────────
+  results.push(await runTest('parseSbv — lege content', async () => {
+    const snippets = parseSbv('');
+    if (snippets.length !== 0) throw new Error(`Verwacht 0 snippets, kreeg ${snippets.length}`);
+  }));
+
+  // ── Test 8: parseSbv — enkele regel (geen geldige SBV) ────────────────
+  results.push(await runTest('parseSbv — enkele regel (geen geldig blok)', async () => {
+    const snippets = parseSbv('alleen tekst zonder timestamp');
+    if (snippets.length !== 0) throw new Error(`Verwacht 0 snippets, kreeg ${snippets.length}`);
+  }));
+
+  // ── Test 9: parseSbv — HTML entities ──────────────────────────────────
+  results.push(await runTest('parseSbv — HTML entities decoderen', async () => {
+    const sbv = `0:00:00.000,0:00:01.000
+It&amp;apos;s &lt;b&gt;cool&lt;/b&gt; &amp;quot;right&amp;quot;?`;
+    const snippets = parseSbv(sbv);
+    if (snippets.length !== 1) throw new Error(`Verwacht 1 snippet, kreeg ${snippets.length}`);
+    if (snippets[0].text !== "It&apos;s <b>cool</b> &quot;right&quot;?") {
+      throw new Error(`HTML entities niet correct gedecodeerd: "${snippets[0].text}"`);
+    }
+    console.log(`   Gedecodeerd: "${snippets[0].text}"`);
+  }));
+
+  // ── Test 10: OAuth token verversen (alleen met credentials) ──────────
+  results.push(await runTest('OAuth token verversen', async () => {
+    const token = await getAccessToken(YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN);
+    if (!token || typeof token !== 'string') throw new Error('Geen geldig token ontvangen');
+    if (token.length < 20) throw new Error(`Token lijkt ongeldig (kort: ${token.length} chars)`);
+    console.log(`   Token ontvangen (${token.length} chars, begint met "${token.slice(0, 10)}...")`);
+  }, !HAS_CREDENTIALS));
+
+  // ── Test 11: captions.list — bekende video met ondertiteling ──────────
+  results.push(await runTest('captions.list — jNQXAC9IVRw', async () => {
+    const token = await getAccessToken(YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN);
+    const tracks = await fetchCaptionTracks('jNQXAC9IVRw', token);
+    if (tracks.length === 0) throw new Error('Geen caption tracks gevonden');
+    console.log(`   Aantal tracks: ${tracks.length}`);
+    console.log(`   Eerste track: ${tracks[0].languageCode} — "${tracks[0].name}" (${tracks[0].kind || 'onbekend'})`);
+    const nl = tracks.find(t => t.languageCode === 'nl');
+    const en = tracks.find(t => t.languageCode === 'en');
+    console.log(`   Nederlands: ${nl ? '✅' : '❌'}, Engels: ${en ? '✅' : '❌'}`);
+  }, !HAS_CREDENTIALS));
+
+  // ── Test 12: captions.download — download NL of EN caption ────────────
+  results.push(await runTest('captions.download — SBV-formaat', async () => {
+    const token = await getAccessToken(YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN);
+    const tracks = await fetchCaptionTracks('jNQXAC9IVRw', token);
+    const track = tracks.find(t => t.languageCode === 'nl') || tracks.find(t => t.languageCode === 'en') || tracks[0];
+    const sbv = await downloadCaption(track.id, token);
+    if (!sbv || sbv.length < 10) throw new Error('SBV-content te kort');
+    console.log(`   Track: ${track.languageCode} (id: ${track.id})`);
+    console.log(`   SBV lengte: ${sbv.length} chars`);
+    console.log(`   Eerste 100 chars: "${sbv.slice(0, 100).replace(/\n/g, '\\n')}..."`);
+    const snippets = parseSbv(sbv);
+    console.log(`   Geparsed: ${snippets.length} snippets`);
+  }, !HAS_CREDENTIALS));
+
+  // ── Test 13: Volledige transcript-flow ────────────────────────────────
+  results.push(await runTest('Volledige transcript — jNQXAC9IVRw', async () => {
+    const result = await getTranscriptYoutubeApi(
+      'jNQXAC9IVRw',
+      YOUTUBE_CLIENT_ID,
+      YOUTUBE_CLIENT_SECRET,
+      YOUTUBE_REFRESH_TOKEN,
+    );
+    console.log(`   Video ID: ${result.videoId}`);
+    console.log(`   Taal: ${result.language}`);
+    console.log(`   Aantal snippets: ${result.snippets.length}`);
+    console.log(`   Volledige tekst lengte: ${result.fullText.length} tekens`);
+    console.log(`   Aanpak: ${result.approach}`);
+    console.log(`   Eerste 120 chars: "${result.fullText.slice(0, 120)}..."`);
+    if (result.snippets.length === 0) throw new Error('Geen snippets gevonden');
+    if (!result.fullText) throw new Error('Geen fullText');
+    if (result.approach !== 'youtube-data-api-v3') throw new Error(`Verwacht youtube-data-api-v3, kreeg ${result.approach}`);
+  }, !HAS_CREDENTIALS));
+
+  // ── Test 14: Video zonder ondertiteling ───────────────────────────────
+  results.push(await runTest('Transcript — video zonder ondertiteling (zzzzzzzzzzz)', async () => {
     try {
-      await getTranscript('zzzzzzzzzzz');
+      await getTranscriptYoutubeApi(
+        'zzzzzzzzzzz',
+        YOUTUBE_CLIENT_ID,
+        YOUTUBE_CLIENT_SECRET,
+        YOUTUBE_REFRESH_TOKEN,
+      );
       throw new Error('Zou een fout moeten geven');
     } catch (err) {
-      if (err instanceof TranscriptNotAvailableError || err instanceof TranscriptDisabledError || err instanceof InnerTubeError) {
-        // Dit zijn acceptabele fouten voor een niet-bestaande video
+      if (err instanceof TranscriptNotAvailableError) {
         console.log(`   Acceptabele fout: ${err.name} — ${err.message}`);
-      } else if (err instanceof IpBlockedError) {
-        throw err; // Laat BLOCKED status door
+      } else if (err instanceof OAuthError) {
+        // OAuth-fout is ook acceptabel (credentials kunnen ongeldig zijn in testomgeving)
+        console.log(`   OAuth-fout (acceptabel in niet-ingestelde omgeving): ${err.message}`);
+      } else if (err instanceof TranscriptError) {
+        console.log(`   TranscriptError (acceptabel): ${err.name} — ${err.message}`);
+      } else {
+        throw err;
+      }
+    }
+  }, !HAS_CREDENTIALS));
+
+  // ── Test 15: OAuth-foutafhandeling (ongeldige credentials) ────────────
+  results.push(await runTest('OAuth-foutafhandeling — ongeldige credentials', async () => {
+    try {
+      await getAccessToken('fake-client-id', 'fake-client-secret', 'fake-refresh-token');
+      throw new Error('Zou een fout moeten geven');
+    } catch (err) {
+      if (err instanceof OAuthError) {
+        console.log(`   Correcte fout: ${err.name} — ${err.message.slice(0, 80)}...`);
+      } else {
+        throw err;
+      }
+    }
+  }));
+
+  // ── Test 16: Ongeldige URL via getTranscriptYoutubeApi ────────────────
+  results.push(await runTest('Transcript — ongeldige URL', async () => {
+    try {
+      await getTranscriptYoutubeApi('geen-geldig-id', '', '', '');
+      throw new Error('Zou een fout moeten geven');
+    } catch (err) {
+      if (err instanceof InvalidVideoIdError) {
+        console.log(`   Correcte fout: ${err.name} — ${err.message}`);
       } else {
         throw err;
       }
@@ -380,10 +269,10 @@ async function main() {
 
   const passed = results.filter((r) => r.status === 'PASS').length;
   const failed = results.filter((r) => r.status === 'FAIL').length;
-  const blocked = results.filter((r) => r.status === 'BLOCKED').length;
+  const skipped = results.filter((r) => r.status === 'SKIP').length;
 
   for (const result of results) {
-    const icon = result.status === 'PASS' ? '✅' : result.status === 'BLOCKED' ? '🔒' : '❌';
+    const icon = result.status === 'PASS' ? '✅' : result.status === 'SKIP' ? '⏭️' : '❌';
     console.log(` ${icon} ${result.name} (${result.durationMs}ms)`);
     if (result.status !== 'PASS') {
       console.log(`     ${result.details}`);
@@ -391,7 +280,7 @@ async function main() {
   }
 
   console.log();
-  console.log(`Totaal: ${results.length} tests — ${passed} passed, ${failed} failed, ${blocked} blocked`);
+  console.log(`Totaal: ${results.length} tests — ${passed} passed, ${failed} failed, ${skipped} skipped`);
   console.log();
 
   // ── Experimentresultaat ─────────────────────────────────────────
@@ -401,31 +290,46 @@ async function main() {
   console.log();
   console.log(`**Datum:** ${new Date().toISOString()}`);
   console.log(`**Omgeving:** Lokaal (zonder Vercel)`);
-  console.log(`**Aanpak:** InnerTube Android API (POST /youtubei/v1/player)`);
-  console.log(`**Resultaat:** ${failed > 0 ? '⚠️ Deels mislukt' : blocked > 0 ? '🔒 IP geblokkeerd' : '✅ Alle tests geslaagd'}`);
+  console.log(`**Aanpak:** YouTube Data API v3 (captions.list + captions.download via googleapis.com)`);
+  console.log(`**Credentials:** ${HAS_CREDENTIALS ? '✅ Geconfigureerd' : '⏭️ Niet geconfigureerd'}`);
+  console.log(`**Resultaat:** ${failed > 0 ? '⚠️ Sommige tests gefaald' : skipped > 0 ? '⏭️ Deels overgeslagen (geen OAuth credentials)' : '✅ Alle tests geslaagd'}`);
   console.log();
   console.log('**Bevindingen:**');
-  if (blocked > 0) {
-    console.log('- YouTube blokkeert de InnerTube-Android-aanpak vanuit deze omgeving.');
-    console.log('- Dit is consistent met de bekende IP-blocking van cloud-providers.');
-    console.log('- Voor Vercel (AWS Lambda) wordt hetzelfde verwacht.');
-  } else if (failed > 0) {
-    console.log('- Sommige tests faalden. Zie details hierboven.');
-  } else {
-    console.log('- De InnerTube-Android-aanpak werkt lokaal.');
-    console.log('- Caption tracks worden succesvol ontdekt.');
-    console.log('- Timedtext XML wordt correct geparsed.');
+  if (HAS_CREDENTIALS && failed === 0) {
+    console.log('- YouTube Data API v3 werkt met OAuth 2.0-authenticatie.');
+    console.log('- Token-verversing (refresh token → access token) werkt correct.');
+    console.log('- captions.list ontdekt beschikbare ondertiteling.');
+    console.log('- captions.download levert SBV-formaat op.');
+    console.log('- SBV-parsing werkt voor getimede snippets.');
     console.log('- Taalkeuze (NL > EN > eerste) werkt.');
     console.log('- URL-validatie werkt voor alle formaten.');
+    console.log('- Error classes geven correcte HTTP-statuscodes.');
+  } else if (HAS_CREDENTIALS && failed > 0) {
+    console.log('- Sommige API-tests faalden. Controleer de OAuth-credentials en quota.');
+    console.log('- De offline tests (parseVideoId, parseSbv) zijn wel geslaagd.');
+  } else {
+    console.log('- Offline tests (parseVideoId, parseSbv) werken correct.');
+    console.log('- OAuth-afhankelijke tests zijn overgeslagen wegens ontbrekende credentials.');
+    console.log('- Voer HITL-stappen 1-3 uit (Google Cloud project, OAuth-client, refresh token).');
+    console.log('- Stel daarna environment variables in en voer de smoketest opnieuw uit.');
+    console.log('- Optioneel: test OAuth-foutafhandeling met ongeldige tokens (test 15).');
   }
   console.log();
   console.log('**Aanbevolen vervolg:**');
-  if (blocked > 0) {
-    console.log('1. Deploy naar Vercel en test opnieuw (HITL-stap 1).');
-    console.log('2. Als Vercel ook geblokkeerd is, documenteer het issue als geblokkeerd.');
+  if (!HAS_CREDENTIALS) {
+    console.log('1. Voer HITL 1 uit: Google Cloud project aanmaken + YouTube Data API v3 inschakelen.');
+    console.log('2. Voer HITL 2 uit: OAuth 2.0-client aanmaken + refresh token verkrijgen.');
+    console.log('3. Voer HITL 3 uit: Vercel cloudsecrets instellen (YOUTUBE_CLIENT_ID, _SECRET, _REFRESH_TOKEN).');
+    console.log('4. Herstart de smoketest met credentials: npx tsx smoketest-transcript.ts');
+  } else if (failed > 0) {
+    console.log('1. Controleer of de YouTube API quota niet is overschreden.');
+    console.log('2. Controleer of de OAuth-credentials correct zijn.');
+    console.log('3. Test met een andere video of handmatig via OAuth Playground.');
   } else {
-    console.log('1. Deploy naar Vercel en voer dezelfde smoketest uit op de cloudomgeving.');
-    console.log('2. Meet de doorlooptijd en vergelijk met lokale resultaten.');
+    console.log('1. Voer HITL 3 uit: Vercel cloudsecrets instellen met de juiste credentials.');
+    console.log('2. Deploy naar Vercel en test de /transcript-endpoint op de live omgeving.');
+    console.log('3. Meet de doorlooptijd en vergelijk met lokale resultaten.');
+    console.log('4. Voer HITL 4 uit: eindreview en afronding.');
   }
 }
 

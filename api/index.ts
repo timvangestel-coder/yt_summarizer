@@ -3,7 +3,12 @@
  * Alle routes worden via rewrites in vercel.json naar deze functie gestuurd.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import * as https from 'node:https';
+import {
+  TranscriptError,
+  TranscriptResult,
+  TranscriptSnippet,
+  getTranscriptYoutubeApi,
+} from './transcript.js';
 
 // ── Environment variables ───────────────────────────────────────────
 const APP_PASSWORD = process.env.APP_PASSWORD;
@@ -15,6 +20,9 @@ const LLM_TIMEOUT_MS = LLM_TIMEOUT_SECONDS * 1000;
 const TEST_PROMPT = process.env.TEST_PROMPT || 'Vat in één zin samen wat een REST API is.';
 const MAX_RESULT_URL_LENGTH = 1500; // max chars voor result in query parameter
 const TRANSCRIPT_VIDEO_ID = process.env.TRANSCRIPT_VIDEO_ID || 'jNQXAC9IVRw';
+const YOUTUBE_CLIENT_ID = process.env.YOUTUBE_CLIENT_ID || '';
+const YOUTUBE_CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET || '';
+const YOUTUBE_REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN || '';
 
 // ── Logging helper ──────────────────────────────────────────────────
 interface LogEntry {
@@ -134,228 +142,7 @@ async function callDeepSeek(prompt: string): Promise<DeepSeekResult> {
   }
 }
 
-// ── YouTube Transcript helpers ──────────────────────────────────────
-
-interface TranscriptSnippet {
-  text: string;
-  start: number;
-  duration: number;
-}
-
-interface TranscriptResult {
-  videoId: string;
-  title: string;
-  language: string;
-  snippets: TranscriptSnippet[];
-  fullText: string;
-}
-
-class TranscriptError extends Error {
-  statusCode: number;
-  videoId: string;
-  constructor(message: string, statusCode: number, videoId: string) {
-    super(message);
-    this.name = 'TranscriptError';
-    this.statusCode = statusCode;
-    this.videoId = videoId;
-  }
-}
-
-/** Voer een HTTPS-request uit en retourneer response als string, met redirect-following. */
-function httpsRequest(url: string, method: string, body?: string, contentType?: string): Promise<{ statusCode: number; body: string }> {
-  const maxRedirects = 5;
-  let redirectCount = 0;
-
-  const doRequest = (currentUrl: string, currentMethod: string, currentBody?: string): Promise<{ statusCode: number; body: string }> => {
-    return new Promise((resolve, reject) => {
-      const urlObj = new URL(currentUrl);
-      const options: https.RequestOptions = {
-        hostname: urlObj.hostname,
-        path: urlObj.pathname + urlObj.search,
-        method: currentMethod,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-        },
-      };
-
-      if (currentBody !== undefined && contentType) {
-        options.headers = {
-          ...options.headers,
-          'Content-Type': contentType,
-          'Content-Length': Buffer.byteLength(currentBody),
-        };
-      }
-
-      const req = https.request(options, (res) => {
-        const { statusCode, headers: respHeaders } = res;
-        const location = respHeaders['location'] as string | undefined;
-
-        // Volg redirect (303 → GET, 301/302/307/308 → zelfde methode)
-        if (statusCode && statusCode >= 300 && statusCode < 400 && location && redirectCount < maxRedirects) {
-          redirectCount++;
-          const redirectUrl = new URL(location, currentUrl).href;
-          const redirectMethod = statusCode === 303 ? 'GET' : currentMethod;
-          resolve(doRequest(redirectUrl, redirectMethod));
-          return;
-        }
-
-        const chunks: Buffer[] = [];
-        res.on('data', (chunk: Buffer) => chunks.push(chunk));
-        res.on('end', () => {
-          resolve({ statusCode: statusCode || 0, body: Buffer.concat(chunks).toString('utf-8') });
-        });
-      });
-
-      req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
-      if (currentBody !== undefined) req.write(currentBody);
-      req.end();
-    });
-  };
-
-  return doRequest(url, method, body);
-}
-
-function httpsPostJson(url: string, body: unknown): Promise<unknown> {
-  const jsonBody = JSON.stringify(body);
-  return httpsRequest(url, 'POST', jsonBody, 'application/json; charset=utf-8').then((res) => {
-    if (res.statusCode >= 400) {
-      throw new Error(`HTTP ${res.statusCode} van InnerTube: ${res.body.slice(0, 200)}`);
-    }
-    try { return JSON.parse(res.body); }
-    catch { throw new Error(`Ongeldige JSON-response (HTTP ${res.statusCode}): ${res.body.slice(0, 200)}`); }
-  });
-}
-
-function httpsGet(url: string): Promise<string> {
-  return httpsRequest(url, 'GET').then((res) => {
-    if (res.statusCode >= 400) {
-      throw new Error(`HTTP ${res.statusCode} bij ophalen timedtext`);
-    }
-    return res.body;
-  });
-}
-
-function decodeHtmlEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, '/');
-}
-
-function parseTimedtextXml(xml: string): TranscriptSnippet[] {
-  const snippets: TranscriptSnippet[] = [];
-  const srv3Regex = /<p\s+t="([^"]*)"\s+d="([^"]*)"[^>]*>([\s\S]*?)<\/p>/g;
-  let srv3Match;
-  let hasSrv3 = false;
-  while ((srv3Match = srv3Regex.exec(xml)) !== null) {
-    hasSrv3 = true;
-    const innerText = srv3Match[3].replace(/<[^>]+>/g, '').trim();
-    snippets.push({
-      text: decodeHtmlEntities(innerText),
-      start: parseFloat(srv3Match[1]) / 1000,
-      duration: parseFloat(srv3Match[2]) / 1000,
-    });
-  }
-  if (!hasSrv3) {
-    const textRegex = /<text start="([^"]+)" dur="([^"]*)">([^<]*)<\/text>/g;
-    let match;
-    while ((match = textRegex.exec(xml)) !== null) {
-      snippets.push({
-        text: decodeHtmlEntities(match[3]),
-        start: parseFloat(match[1]),
-        duration: match[2] ? parseFloat(match[2]) : 0,
-      });
-    }
-  }
-  return snippets;
-}
-
-async function getTranscript(videoId: string): Promise<TranscriptResult> {
-  const innerTubeBody = {
-    context: { client: { clientName: 'ANDROID', clientVersion: '20.10.38' } },
-    videoId,
-  };
-
-  let response: unknown;
-  try {
-    response = await httpsPostJson('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', innerTubeBody);
-  } catch (err) {
-    throw new TranscriptError(`Interne fout bij ophalen ondertiteling: ${err instanceof Error ? err.message : 'Onbekende fout'}`, 502, videoId);
-  }
-
-  const resp = response as Record<string, unknown>;
-
-  // Controleer op playabilityStatus (LOGIN_REQUIRED = IP-blokkade door cloudprovider)
-  const playabilityStatus = resp?.playabilityStatus as Record<string, unknown> | undefined;
-  const playabilityStatusText = playabilityStatus?.status as string | undefined;
-  console.error(`[transcript] InnerTube response for ${videoId}: playabilityStatus=${playabilityStatusText}`);
-
-  if (playabilityStatusText === 'LOGIN_REQUIRED' || playabilityStatusText === 'UNPLAYABLE') {
-    const errorScreen = playabilityStatus?.errorScreen as Record<string, unknown> | undefined;
-    const errorRenderer = errorScreen?.playerErrorMessageRenderer as Record<string, unknown> | undefined;
-    const reasonObj = errorRenderer?.reason as Record<string, unknown> | undefined;
-    const reasonRuns = reasonObj?.runs as Array<Record<string, unknown>> | undefined;
-    const reasonText = reasonRuns?.[0]?.text as string | undefined;
-    const reason = (playabilityStatus?.reason as string) || reasonText || 'Onbekende reden';
-    console.error(`[transcript] YouTube blokkade: ${reason}`);
-    throw new TranscriptError(
-      'YouTube blokkeert verzoeken vanuit deze cloudomgeving (Vercel/AWS). ' +
-      `Reden: ${reason}. ` +
-      'De InnerTube-Android-aanpak werkt niet vanaf cloudproviders. ' +
-      'Zie research/youtube-transcript-zonder-api.md voor details.',
-      503,
-      videoId,
-    );
-  }
-
-  // Controleer op error-response van InnerTube
-  if (resp?.error && typeof resp.error === 'object') {
-    const errObj = resp.error as Record<string, unknown>;
-    const errMessage = String(errObj?.message || 'Onbekende fout van YouTube');
-    const errCode = errObj?.code as number | undefined;
-    console.error(`[transcript] InnerTube error for video ${videoId}: code=${errCode}, message="${errMessage}"`);
-    throw new TranscriptError(`YouTube InnerTube-fout: ${errMessage}`, 502, videoId);
-  }
-
-  const videoDetails = resp?.videoDetails as Record<string, unknown> | undefined;
-  const title: string = (videoDetails?.title as string) || 'Onbekende titel';
-
-  const captions = resp?.captions as Record<string, unknown> | undefined;
-  const tracklistRenderer = captions?.playerCaptionsTracklistRenderer as Record<string, unknown> | undefined;
-  const captionTracksRaw = tracklistRenderer?.captionTracks as Array<Record<string, unknown>> | undefined;
-
-  if (!captionTracksRaw || captionTracksRaw.length === 0) {
-    console.error(`[transcript] No caption tracks for ${videoId}. Response keys: ${Object.keys(resp).join(', ')}`);
-    throw new TranscriptError('Deze video heeft geen beschikbare ondertiteling.', 404, videoId);
-  }
-
-  // Kies beste taal: NL > EN > eerste
-  let selectedTrack = captionTracksRaw.find((t) => t.languageCode === 'nl');
-  if (!selectedTrack) selectedTrack = captionTracksRaw.find((t) => t.languageCode === 'en');
-  if (!selectedTrack) selectedTrack = captionTracksRaw[0];
-
-  const baseUrl = selectedTrack.baseUrl as string;
-  const language = selectedTrack.languageCode as string;
-
-  let xml: string;
-  try {
-    xml = await httpsGet(baseUrl);
-  } catch (err) {
-    throw new TranscriptError(`Fout bij ophalen ondertiteling: ${err instanceof Error ? err.message : 'Onbekende fout'}`, 502, videoId);
-  }
-
-  const snippets = parseTimedtextXml(xml);
-  if (snippets.length === 0) {
-    throw new TranscriptError('Deze video heeft geen beschikbare ondertiteling.', 404, videoId);
-  }
-
-  const fullText = snippets.map((s) => s.text).join(' ');
-  return { videoId, title, language, snippets, fullText };
-}
+// ── YouTube Transcript (via YouTube Data API v3, geïmporteerd uit transcript.ts) ──
 
 // ── HTML templates ──────────────────────────────────────────────────
 const PAGE_STYLE = `
@@ -461,8 +248,7 @@ function renderTranscriptPage(error?: string, result?: TranscriptResult, duratio
 <body>
   <div class="card" style="max-width: 800px;">
     <h1>🎬 YouTube Transcript</h1>
-    <p>Haal de ondertiteling op van een bekende YouTube-video via de InnerTube API.</p>
-
+    <p>Haal de ondertiteling op van een bekende YouTube-video via de YouTube Data API v3 (OAuth 2.0).</p>
     <form method="POST" action="/transcript" id="transcript-form">
       <button type="submit" id="submit-btn">📥 Haal transcript op van voorbeeldvideo</button>
     </form>
@@ -629,12 +415,30 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  // --- Transcript ophalen (POST) ---
+  // --- Transcript ophalen (POST) — YouTube Data API v3 ---
   if (method === 'POST' && pathname === '/transcript') {
     const startTime = Date.now();
 
+    // Controleer of OAuth credentials zijn geconfigureerd
+    if (!YOUTUBE_CLIENT_ID || !YOUTUBE_CLIENT_SECRET || !YOUTUBE_REFRESH_TOKEN) {
+      console.error('[transcript] YouTube API credentials not configured. Set YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN.');
+      const encodedError = encodeURIComponent(
+        'YouTube API-credentials zijn niet geconfigureerd. Voer eerst HITL-stappen 1-3 uit: ' +
+        'Google Cloud-project aanmaken, OAuth-client aanmaken en refresh token verkrijgen. ' +
+        'Zie de issue voor instructies.'
+      );
+      res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
+      res.end();
+      return;
+    }
+
     try {
-      const result = await getTranscript(TRANSCRIPT_VIDEO_ID);
+      const result = await getTranscriptYoutubeApi(
+        TRANSCRIPT_VIDEO_ID,
+        YOUTUBE_CLIENT_ID,
+        YOUTUBE_CLIENT_SECRET,
+        YOUTUBE_REFRESH_TOKEN,
+      );
       const durationMs = Date.now() - startTime;
 
       // Beperk fullText lengte voor URL parameter
