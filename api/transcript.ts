@@ -763,6 +763,7 @@ export async function fetchTranscriptViaProxy(
   // ── Stap 2: GET naar baseUrl via proxy ──────────────────────────────
   const baseUrlObj = new URL(baseUrl);
   const proxyPath = baseUrlObj.pathname + baseUrlObj.search;
+  console.log(`[transcript/proxy] Transcript URL path: ${proxyPath}`);
 
   let transcriptResponse: Response;
   try {
@@ -785,6 +786,8 @@ export async function fetchTranscriptViaProxy(
     );
   }
 
+  console.log(`[transcript/proxy] Transcript response status: ${transcriptResponse.status}`);
+
   if (!transcriptResponse.ok) {
     throw new TranscriptError(
       `Transcript download fout (HTTP ${transcriptResponse.status}).`,
@@ -794,9 +797,13 @@ export async function fetchTranscriptViaProxy(
   }
 
   const xmlContent = await transcriptResponse.text();
+  console.log(`[transcript/proxy] Transcript XML length: ${xmlContent.length}`);
+  console.log(`[transcript/proxy] Transcript XML preview: ${xmlContent.slice(0, 300)}`);
 
   // ── Stap 3: Parse XML naar TranscriptSnippet[] ──────────────────────
-  return parseTranscriptXml(xmlContent, videoId);
+  const result = parseTranscriptXml(xmlContent, videoId);
+  console.log(`[transcript/proxy] Parsed ${result.length} snippets`);
+  return result;
 }
 
 /**
