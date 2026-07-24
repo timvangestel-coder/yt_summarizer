@@ -75,6 +75,11 @@ export async function checkConnection(): Promise<{ ok: true } | { ok: false; err
       client.release();
     }
   } catch (err) {
+    // Debug: log de raw error voor диагностика
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    const rawStack = err instanceof Error ? err.stack : '';
+    console.error('[db] Raw connection error:', rawMessage);
+    console.error('[db] Raw stack:', rawStack);
     return { ok: false, error: sanitizeError(err) };
   }
 }
