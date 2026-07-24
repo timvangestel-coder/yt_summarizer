@@ -1,14 +1,9 @@
 /**
- * YouTube Transcript — Hybride aanpak (PoC)
+ * YouTube Data API v3 — Transcript ophalen via OAuth 2.0
  *
- * Haalt ondertiteling op van publieke YouTube-video's zonder dat
- * de video-eigenaar hoeft te zijn. Combineert twee methodes:
- *
- * 1. **YouTube Data API v3 (OAuth 2.0)** — captions.list voor taaldetectie
- *    (werkt vanuit elke omgeving via googleapis.com)
- * 2. **youtube-transcript package** — daadwerkelijke download via
- *    www.youtube.com (web-infrastructuur, geen IP-blokkade verwacht)
- * 3. **Fallback** — captions.download voor eigen video's (via OAuth)
+ * Vervangt de InnerTube-Android-aanpak die cloud-IP's blokkeert.
+ * Gebruikt captions.list + captions.download via googleapis.com
+ * met OAuth 2.0 token-verversing (refresh token flow).
  *
  * Codeerstijl: zelfde als mtgnews (Node.js https module, regex-based parsing)
  *
@@ -16,7 +11,6 @@
  */
 
 import * as https from 'node:https';
-import { YoutubeTranscript } from 'youtube-transcript';
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -355,7 +349,6 @@ export async function fetchCaptionTracks(videoId: string, accessToken: string): 
  * @param accessToken - Geldig OAuth 2.0 access token
  * @returns SBV-content als string
  * @throws OAuthError bij authenticatiefout
- * @deprecated Alleen voor eigen video's. Gebruik fetchTranscriptViaPackage voor publieke video's.
  */
 export async function downloadCaption(captionId: string, accessToken: string): Promise<string> {
   const url = `https://www.googleapis.com/youtube/v3/captions/${encodeURIComponent(captionId)}?tfmt=sbv`;
@@ -373,53 +366,6 @@ export async function downloadCaption(captionId: string, accessToken: string): P
       throw new TranscriptError('Ondertiteling niet gevonden (caption track ID ongeldig).', 404, '');
     }
     throw new TranscriptError(`Fout bij downloaden ondertiteling: ${message}`, 502, '');
-  }
-}
-
-/**
- * Download een transcript via de youtube-transcript package.
- *
- * Werkt voor alle publieke YouTube-video's zonder dat de gebruiker
- * video-eigenaar hoeft te zijn. Maakt gebruik van de www.youtube.com
- * web-infrastructuur (niet googleapis.com), waardoor IP-blokkades
- * vanuit cloud-omgevingen onwaarschijnlijker zijn.
- *
- * @param videoId - YouTube video ID
- * @param lang - Optionele taalcode (bv. 'nl', 'en'). Eerste beschikbare taal bij leeg.
- * @returns Array van TranscriptSnippet objecten
- * @throws TranscriptNotAvailableError bij geen beschikbaar transcript
- * @throws TranscriptDisabledError als ondertiteling is uitgeschakeld
- * @throws QuotaExceededError bij te veel requests
- */
-export async function fetchTranscriptViaPackage(
-  videoId: string,
-  lang?: string,
-): Promise<TranscriptSnippet[]> {
-  try {
-    const config = lang ? { lang } : undefined;
-    const segments = await YoutubeTranscript.fetchTranscript(videoId, config);
-    if (!segments || segments.length === 0) {
-      throw new TranscriptNotAvailableError(videoId);
-    }
-    return segments.map((s) => ({
-      text: s.text,
-      start: s.offset / 1000, // milliseconden → seconden
-      duration: s.duration / 1000,
-    }));
-  } catch (err) {
-    // Vertaal youtube-transcript errors naar onze error classes
-    if (err instanceof TranscriptError) throw err;
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.toLowerCase().includes('disabled') || msg.includes('Transcript is disabled')) {
-      throw new TranscriptDisabledError(videoId);
-    }
-    if (msg.toLowerCase().includes('not available') || msg.includes('No transcripts')) {
-      throw new TranscriptNotAvailableError(videoId);
-    }
-    if (msg.toLowerCase().includes('too many request') || msg.toLowerCase().includes('captcha')) {
-      throw new QuotaExceededError(videoId);
-    }
-    throw new TranscriptError(`Fout bij ophalen transcript: ${msg}`, 502, videoId);
   }
 }
 
@@ -509,16 +455,11 @@ function pickBestCaptionTrack(tracks: CaptionTrack[]): CaptionTrack | null {
 // ── Hoofdfunctie ───────────────────────────────────────────────────
 
 /**
- * Haal het transcript van een YouTube-video op via de hybride aanpak.
- *
- * Doorloopt de volgende flow:
- * 1. Valideer video ID
- * 2. (Optioneel) captions.list via OAuth voor taaldetectie
- * 3. youtube-transcript package voor daadwerkelijke download (publieke video's)
- * 4. Fallback naar captions.download via OAuth (alleen voor eigen video's)
+ * Haal het transcript van een YouTube-video op via de officiële YouTube Data API v3.
+ * Doorloopt de volledige flow: token verversen → captions.list → captions.download → SBV parse.
  *
  * @param videoId - YouTube video ID
- * @param clientId - OAuth 2.0 Client ID (optioneel, alleen voor taaldetectie/fallback)
+ * @param clientId - OAuth 2.0 Client ID
  * @param clientSecret - OAuth 2.0 Client Secret
  * @param refreshToken - OAuth 2.0 Refresh Token
  * @returns TranscriptResult
@@ -535,76 +476,43 @@ export async function getTranscriptYoutubeApi(
     throw new InvalidVideoIdError(videoId);
   }
 
-  // Stap 2: Optionele taaldetectie via OAuth (captions.list)
-  let selectedLanguage: string | undefined;
-  let tracks: CaptionTrack[] = [];
-  let oauthAvailable = false;
-
-  if (clientId && clientSecret && refreshToken) {
-    try {
-      const accessToken = await getAccessToken(clientId, clientSecret, refreshToken);
-      tracks = await fetchCaptionTracks(videoId, accessToken);
-      oauthAvailable = true;
-      const best = pickBestCaptionTrack(tracks);
-      if (best) selectedLanguage = best.languageCode;
-    } catch (err) {
-      // OAuth-fout is niet fataal — verder met standaard taal
-      console.error(`[transcript] OAuth taaldetectie mislukt voor ${videoId}:`,
-        err instanceof Error ? err.message : err);
-    }
-  }
-
-  // Stap 3: Download transcript via youtube-transcript package (publieke video's)
+  // Stap 2: Verkrijg access token
+  let accessToken: string;
   try {
-    const snippets = await fetchTranscriptViaPackage(videoId, selectedLanguage);
-    const fullText = snippets.map((s) => s.text).join(' ');
-
-    return {
-      videoId,
-      title: `Video ${videoId}`,
-      language: selectedLanguage || (snippets.length > 0 ? 'onbekend' : ''),
-      snippets,
-      fullText,
-      approach: 'youtube-transcript',
-    };
-  } catch (packageErr) {
-    // Stap 4: Fallback naar captions.download via OAuth (alleen eigen video's)
-    if (oauthAvailable && tracks.length > 0) {
-      console.error(`[transcript] Package download mislukt voor ${videoId}, probeer OAuth fallback:`,
-        packageErr instanceof Error ? packageErr.message : packageErr);
-
-      const selectedTrack = pickBestCaptionTrack(tracks);
-      if (!selectedTrack) {
-        throw packageErr; // Geen tracks beschikbaar
-      }
-
-      try {
-        const token = await getAccessToken(clientId, clientSecret, refreshToken);
-        const sbvContent = await downloadCaption(selectedTrack.id, token);
-        const snippets = parseSbv(sbvContent);
-
-        if (snippets.length === 0) {
-          throw packageErr;
-        }
-
-        const fullText = snippets.map((s) => s.text).join(' ');
-        return {
-          videoId,
-          title: `Video ${videoId}`,
-          language: selectedTrack.languageCode,
-          snippets,
-          fullText,
-          approach: 'youtube-data-api-v3',
-        };
-      } catch {
-        // Fallback faalt ook, gooi originele fout
-        throw packageErr;
-      }
-    }
-
-    // Geen fallback beschikbaar
-    throw packageErr;
+    accessToken = await getAccessToken(clientId, clientSecret, refreshToken);
+  } catch (err) {
+    if (err instanceof TranscriptError) throw err;
+    throw new OAuthError(videoId, err instanceof Error ? err.message : 'Onbekende fout bij token-verversing');
   }
+
+  // Stap 3: Haal caption tracks op
+  const tracks = await fetchCaptionTracks(videoId, accessToken);
+
+  // Stap 4: Kies beste taal
+  const selectedTrack = pickBestCaptionTrack(tracks);
+  if (!selectedTrack) {
+    throw new TranscriptNotAvailableError(videoId);
+  }
+
+  // Stap 5: Download caption in SBV-formaat
+  const sbvContent = await downloadCaption(selectedTrack.id, accessToken);
+
+  // Stap 6: Parse SBV naar snippets
+  const snippets = parseSbv(sbvContent);
+  if (snippets.length === 0) {
+    throw new TranscriptNotAvailableError(videoId);
+  }
+
+  const fullText = snippets.map((s) => s.text).join(' ');
+
+  return {
+    videoId,
+    title: `Video ${videoId}`,
+    language: selectedTrack.languageCode,
+    snippets,
+    fullText,
+    approach: 'youtube-data-api-v3',
+  };
 }
 
 /**
