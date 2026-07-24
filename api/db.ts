@@ -25,6 +25,7 @@ let pool: pg.Pool | null = null;
 
 function getConnectionString(): string {
   const url = process.env.DATABASE_URL;
+  console.error('[db] DATABASE_URL present:', !!url, 'length:', url?.length ?? 0, 'prefix:', url ? url.slice(0, 20) + '...' : 'NONE');
   if (!url) {
     throw new DbConfigError('DATABASE_URL is niet geconfigureerd.');
   }
