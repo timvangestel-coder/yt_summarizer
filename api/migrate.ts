@@ -4,7 +4,7 @@
  * Idempotent: kan veilig bij elke deploy worden uitgevoerd (CREATE TABLE IF NOT EXISTS).
  */
 
-import { getPool, sanitizeError } from './db.js';
+import { getPool, sanitizeError, type DbTestResult } from './db.js';
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -58,16 +58,18 @@ export async function insertTestResult(label: string, resultaat: string): Promis
     'INSERT INTO test_resultaten (label, resultaat) VALUES ($1, $2) RETURNING id',
     [label, resultaat],
   );
-  return result.rows[0].id as number;
+  const id = result.rows[0].id;
+  // pg returns SERIAL as number, but types say string | number
+  return typeof id === 'number' ? id : Number(id);
 }
 
 /**
  * Haal alle testresultaten op (nieuwste eerst).
  */
-export async function getAllTestResults(): Promise<Array<{ id: number; label: string; resultaat: string; aangemaakt_op: string }>> {
+export async function getAllTestResults(): Promise<DbTestResult[]> {
   const pool = getPool();
   const result = await pool.query(
     'SELECT id, label, resultaat, aangemaakt_op FROM test_resultaten ORDER BY aangemaakt_op DESC LIMIT 100',
   );
-  return result.rows;
+  return result.rows as DbTestResult[];
 }

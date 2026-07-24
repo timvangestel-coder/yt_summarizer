@@ -421,6 +421,15 @@ function renderDbTestPage(props: DbTestPageProps): string {
 </html>`;
 }
 
+/** Lees het volledige request-body als string. */
+async function readBody(req: IncomingMessage): Promise<string> {
+  let body = '';
+  for await (const chunk of req) {
+    body += chunk;
+  }
+  return body;
+}
+
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -598,21 +607,22 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   // --- Database test pagina (GET) ---
   if (method === 'GET' && pathname === '/db-test') {
+    const parsedUrl = new URL(url, 'http://localhost');
     const dbStatus = await checkConnection();
     const results = dbStatus.ok ? await getAllTestResults().catch(() => []) : [];
-    const savedId = url.includes('saved=') ? Number(new URL(url, 'http://localhost').searchParams.get('saved')) : undefined;
+    const savedId = parsedUrl.searchParams.has('saved') ? Number(parsedUrl.searchParams.get('saved')) : undefined;
+    const errorParam = parsedUrl.searchParams.get('error') || undefined;
+    const migrateParam = parsedUrl.searchParams.get('migrate') || undefined;
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderDbTestPage({ dbStatus, results, savedId }));
+    res.end(renderDbTestPage({ dbStatus, results, savedId, error: errorParam, migrateResult: migrateParam }));
     return;
   }
 
   // --- Database test verwerken (POST) ---
   if (method === 'POST' && pathname === '/db-test') {
-    let body = '';
+    let body: string;
     try {
-      for await (const chunk of req) {
-        body += chunk;
-      }
+      body = await readBody(req);
     } catch {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Fout bij lezen verzoekbody.' }));
