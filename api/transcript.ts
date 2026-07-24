@@ -715,6 +715,22 @@ export async function fetchTranscriptViaProxy(
 
   // Navigeer: captions → playerCaptionsTracklistRenderer → captionTracks[]
   const captions = playerData.captions as Record<string, unknown> | undefined;
+  if (captions) {
+    console.log(`[transcript/proxy] captions keys: ${Object.keys(captions).join(', ')}`);
+    const tlr = captions.playerCaptionsTracklistRenderer as Record<string, unknown> | undefined;
+    if (tlr) {
+      console.log(`[transcript/proxy] tracklistRenderer keys: ${Object.keys(tlr).join(', ')}`);
+      const ct = tlr.captionTracks as Array<unknown> | undefined;
+      console.log(`[transcript/proxy] captionTracks: ${ct ? ct.length : 'undefined'}`);
+      if (ct && ct.length > 0) {
+        console.log(`[transcript/proxy] First track keys: ${Object.keys(ct[0] as Record<string, unknown>).join(', ')}`);
+        console.log(`[transcript/proxy] First track languageCode: ${(ct[0] as Record<string, unknown>).languageCode}`);
+      }
+    } else {
+      console.log(`[transcript/proxy] NO playerCaptionsTracklistRenderer in captions`);
+    }
+  }
+  const captions = playerData.captions as Record<string, unknown> | undefined;
   if (!captions) {
     throw new TranscriptNotAvailableError(videoId);
   }
