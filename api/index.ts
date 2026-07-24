@@ -484,7 +484,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (method === 'GET' && pathname === '/debug-transcript') {
     try {
       const { YoutubeTranscript } = await import('youtube-transcript');
-      const videoId = TRANSCRIPT_VIDEO_ID;
+      const parsedUrl = new URL(url, 'http://localhost');
+      const videoId = parsedUrl.searchParams.get('videoId') || TRANSCRIPT_VIDEO_ID;
      
       // Test 1: InnerTube via www.youtube.com (ANDROID client)
       let innerTubeResult = 'niet geprobeerd';
