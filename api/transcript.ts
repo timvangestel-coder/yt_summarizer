@@ -608,6 +608,229 @@ export async function getTranscriptYoutubeApi(
 }
 
 /**
+ * Download een transcript via de proxy relay (Cloudflare Tunnel → thuis-PC → YouTube).
+ *
+ * Maakt een InnerTube-request naar de generieke reverse proxy. De proxy
+ * routeert via een consumer ISP, waardoor YouTube geen datacenter-IP blokkeert.
+ *
+ * @param videoId - YouTube video ID
+ * @param proxyUrl - Basis-URL van de proxy (bv. https://random.trycloudflare.com)
+ * @param apiKey - API-key voor proxy-authenticatie
+ * @param lang - Optionele taalcode (bv. 'nl', 'en')
+ * @returns Array van TranscriptSnippet objecten
+ * @throws TranscriptNotAvailableError bij geen beschikbaar transcript
+ * @throws TranscriptError bij proxy- of netwerkfouten
+ */
+export async function fetchTranscriptViaProxy(
+  videoId: string,
+  proxyUrl: string,
+  apiKey: string,
+  lang?: string,
+): Promise<TranscriptSnippet[]> {
+  // Valideer video ID
+  if (!parseVideoId(videoId)) {
+    throw new InvalidVideoIdError(videoId);
+  }
+
+  // Bouw InnerTube request body (zelfde formaat als youtube-transcript package)
+  const innerTubeBody = {
+    context: {
+      client: {
+        clientName: 'ANDROID',
+        clientVersion: '19.09.37',
+        hl: lang || 'en',
+        gl: 'US',
+        androidSdkVersion: 31,
+      },
+    },
+    videoId,
+  };
+
+  const proxyEndpoint = `${proxyUrl.replace(/\/+$/, '')}/youtubei/v1/transcript/get_transcript`;
+
+  let response: Response;
+  try {
+    // Gebruik fetch() i.p.v. httpsPostJson omdat we de HTTP-statuscode nodig hebben
+    // voor foutdifferentiatie (401 vs 403 vs 502). httpsPostJson geeft alleen een
+    // string-rejectie zonder statuscode.
+    response = await fetch(proxyEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'x-api-key': apiKey,
+        'x-forwarded-host': 'www.youtube.com',
+        'User-Agent': 'CloudAI-POC/1.0',
+      },
+      body: JSON.stringify(innerTubeBody),
+      signal: AbortSignal.timeout(30000), // 30s timeout
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TimeoutError') {
+      throw new TranscriptError('Proxy request timeout (30s).', 504, videoId);
+    }
+    throw new TranscriptError(
+      `Netwerkfout bij proxy-request: ${err instanceof Error ? err.message : String(err)}`,
+      502,
+      videoId,
+    );
+  }
+
+  if (!response.ok) {
+    const bodyText = await response.text().catch(() => '');
+    if (response.status === 401) {
+      throw new TranscriptError('Proxy authenticatiefout. Controleer de PROXY_API_KEY.', 502, videoId);
+    }
+    if (response.status === 403) {
+      throw new TranscriptError(
+        `Domein niet toegestaan in proxy whitelist. Controleer de proxy configuratie.`,
+        502,
+        videoId,
+      );
+    }
+    throw new TranscriptError(
+      `Proxy fout (HTTP ${response.status}): ${bodyText.slice(0, 200)}`,
+      502,
+      videoId,
+    );
+  }
+
+  // Parse de InnerTube response
+  let data: unknown;
+  try {
+    data = await response.json();
+  } catch {
+    throw new TranscriptError('Ongeldige JSON-response van proxy/YouTube.', 502, videoId);
+  }
+
+  const snippets = parseInnerTubeTranscriptResponse(data, videoId);
+  if (snippets.length === 0) {
+    throw new TranscriptNotAvailableError(videoId);
+  }
+  return snippets;
+}
+
+/**
+ * Parse een InnerTube transcript-response naar TranscriptSnippet[].
+ *
+ * InnerTube response-structuur:
+ * ```
+ * {
+ *   "actions": [{
+ *     "updateEngagementPanelAction": {
+ *       "content": {
+ *         "transcriptRenderer": {
+ *           "body": {
+ *             "transcriptBodyRenderer": {
+ *               "cueGroups": [{
+ *                 "cues": [{
+ *                   "cue": {
+ *                     "transcriptCueRenderer": {
+ *                       "cue": { "simpleText": "..." },
+ *                       "relativeOffsetMs": "1000",
+ *                       "durationMs": "2000"
+ *                     }
+ *                   }
+ *                 }]
+ *               }]
+ *             }
+ *           }
+ *         }
+ *       }
+ *     }
+ *   }]
+ * }
+ * ```
+ */
+function parseInnerTubeTranscriptResponse(
+  data: unknown,
+  videoId: string,
+): TranscriptSnippet[] {
+  if (!data || typeof data !== 'object') {
+    throw new TranscriptError('Lege response van InnerTube API.', 502, videoId);
+  }
+
+  const root = data as Record<string, unknown>;
+  const actions = root.actions;
+  if (!Array.isArray(actions) || actions.length === 0) {
+    throw new TranscriptNotAvailableError(videoId);
+  }
+
+  // Zoek de transcript-actions
+  for (const action of actions) {
+    if (!action || typeof action !== 'object') continue;
+    const act = action as Record<string, unknown>;
+
+    const updatePanel = act.updateEngagementPanelAction as Record<string, unknown> | undefined;
+    if (!updatePanel) continue;
+
+    const content = updatePanel.content as Record<string, unknown> | undefined;
+    if (!content) continue;
+
+    const transcriptRenderer = content.transcriptRenderer as Record<string, unknown> | undefined;
+    if (!transcriptRenderer) continue;
+
+    const body = transcriptRenderer.body as Record<string, unknown> | undefined;
+    if (!body) continue;
+
+    const transcriptBodyRenderer = body.transcriptBodyRenderer as Record<string, unknown> | undefined;
+    if (!transcriptBodyRenderer) continue;
+
+    const cueGroups = transcriptBodyRenderer.cueGroups;
+    if (!Array.isArray(cueGroups)) continue;
+
+    const snippets: TranscriptSnippet[] = [];
+    for (const group of cueGroups) {
+      if (!group || typeof group !== 'object') continue;
+      const grp = group as Record<string, unknown>;
+      const cues = grp.cues;
+      if (!Array.isArray(cues)) continue;
+
+      for (const cue of cues) {
+        if (!cue || typeof cue !== 'object') continue;
+        const c = cue as Record<string, unknown>;
+        const cueInner = c.cue as Record<string, unknown> | undefined;
+        if (!cueInner) continue;
+
+        const renderer = cueInner.transcriptCueRenderer as Record<string, unknown> | undefined;
+        if (!renderer) continue;
+
+        // Haal tekst op — kan simpleText of runs[] zijn
+        const cueText = renderer.cue as Record<string, unknown> | undefined;
+        let text = '';
+        if (cueText && typeof cueText.simpleText === 'string') {
+          text = cueText.simpleText;
+        } else if (cueText && Array.isArray(cueText.runs)) {
+          text = cueText.runs
+            .map((r: unknown) => {
+              if (r && typeof r === 'object' && 'text' in (r as Record<string, unknown>)) {
+                return (r as Record<string, unknown>).text as string;
+              }
+              return '';
+            })
+            .join('');
+        }
+
+        if (!text) continue;
+
+        const startMs = Number(renderer.relativeOffsetMs) || 0;
+        const durationMs = Number(renderer.durationMs) || 0;
+
+        snippets.push({
+          text,
+          start: startMs / 1000,
+          duration: durationMs / 1000,
+        });
+      }
+    }
+
+    return snippets;
+  }
+
+  // Geen transcript-renderer gevonden
+  throw new TranscriptNotAvailableError(videoId);
+}
+
+/**
  * Formatteer een fout naar een gebruiksvriendelijk bericht met HTTP-statuscode.
  */
 export function formatTranscriptError(err: unknown): { message: string; statusCode: number } {

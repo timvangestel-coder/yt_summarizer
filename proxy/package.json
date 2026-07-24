@@ -1,0 +1,14 @@
+{
+  "name": "cloud-ai-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Generieke reverse proxy voor Cloud AI POC — 0 npm dependencies, alleen Node.js built-ins.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

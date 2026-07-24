@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Reverse Proxy Configuration",
+  "description": "Configuratie voor de generieke Node.js reverse proxy (0 npm deps).",
+  "type": "object",
+  "required": ["apiKey", "port", "bindAddress", "allowedDomains"],
+  "properties": {
+    "apiKey": {
+      "type": "string",
+      "description": "API key voor authenticatie. Clients moeten deze meegeven in de x-api-key header.",
+      "minLength": 1
+    },
+    "port": {
+      "type": "integer",
+      "description": "Poort waar de proxy op luistert.",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 3000
+    },
+    "bindAddress": {
+      "type": "string",
+      "description": "IP-adres om aan te binden. Gebruik 127.0.0.1 voor lokale toegang alleen.",
+      "default": "127.0.0.1"
+    },
+    "allowedDomains": {
+      "type": "object",
+      "description": "Map van domein-namen naar target configuraties.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["target"],
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Basis-URL van het doeldomein (inclusief protocol).",
+            "pattern": "^https?://"
+          },
+          "headers": {
+            "type": "object",
+            "description": "Extra headers om aan uitgaande requests toe te voegen.",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

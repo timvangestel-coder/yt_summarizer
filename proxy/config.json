@@ -1,0 +1,23 @@
+{
+  "$schema": "./config.schema.json",
+  "apiKey": "test123",
+  "port": 3000,
+  "bindAddress": "127.0.0.1",
+  "allowedDomains": {
+    "www.youtube.com": {
+      "target": "https://www.youtube.com",
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9,nl;q=0.8",
+        "Origin": "https://www.youtube.com"
+      }
+    },
+    "youtubei.googleapis.com": {
+      "target": "https://youtubei.googleapis.com",
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    }
+  }
+}

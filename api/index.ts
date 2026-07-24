@@ -8,6 +8,7 @@ import {
   TranscriptResult,
   TranscriptSnippet,
   getTranscriptYoutubeApi,
+  fetchTranscriptViaProxy,
 } from './transcript.js';
 
 // ── Environment variables ───────────────────────────────────────────
@@ -23,6 +24,8 @@ const TRANSCRIPT_VIDEO_ID = process.env.TRANSCRIPT_VIDEO_ID || 'RyQD8jQrenU';
 const YOUTUBE_CLIENT_ID = process.env.YOUTUBE_CLIENT_ID || '';
 const YOUTUBE_CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET || '';
 const YOUTUBE_REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN || '';
+const PROXY_URL = process.env.PROXY_URL || '';
+const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
 
 // ── Logging helper ──────────────────────────────────────────────────
 interface LogEntry {
@@ -249,9 +252,14 @@ function renderTranscriptPage(error?: string, result?: TranscriptResult, duratio
   <div class="card" style="max-width: 800px;">
     <h1>🎬 YouTube Transcript</h1>
     <p>Haal de ondertiteling op van een bekende YouTube-video — werkt voor alle publieke video's zonder inloggen.</p>
-    <form method="POST" action="/transcript" id="transcript-form">
-      <button type="submit" id="submit-btn">📥 Haal transcript op van voorbeeldvideo</button>
-    </form>
+    <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:1rem;">
+      <form method="POST" action="/transcript" id="transcript-form">
+        <button type="submit" id="submit-btn" style="background:#3b82f6;">📥 Haal transcript op (youtube-transcript)</button>
+      </form>
+      <form method="POST" action="/transcript/proxy" id="transcript-proxy-form">
+        <button type="submit" id="submit-proxy-btn" style="background:#8b5cf6;">📡 Via thuis-proxy</button>
+      </form>
+    </div>
 
     ${error ? `<div class="result"><p style="color:#ef4444;">❌ Fout</p><div class="result-box error-box">${escapeHtml(error)}</div></div>` : ''}
 
@@ -287,10 +295,16 @@ function renderTranscriptPage(error?: string, result?: TranscriptResult, duratio
   </div>
 
   <script>
-    document.getElementById('transcript-form')?.addEventListener('submit', function(e) {
-      const btn = document.getElementById('submit-btn');
-      btn.disabled = true;
-      btn.innerHTML = '<span class="spinner"></span> Bezig met ophalen transcript...';
+    const forms = [
+      { id: 'transcript-form', btnId: 'submit-btn', label: 'Bezig met ophalen transcript...' },
+      { id: 'transcript-proxy-form', btnId: 'submit-proxy-btn', label: 'Bezig met ophalen via proxy...' },
+    ];
+    forms.forEach(({ id, btnId, label }) => {
+      document.getElementById(id)?.addEventListener('submit', function(e) {
+        const btn = document.getElementById(btnId);
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> ' + label;
+      });
     });
   </script>
 </body>
@@ -449,6 +463,63 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       } else {
         console.error(`[transcript] Unexpected error for ${TRANSCRIPT_VIDEO_ID} after ${durationMs}ms:`, err);
         const encodedError = encodeURIComponent('Er is een onbekende fout opgetreden bij het ophalen van het transcript.');
+        res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
+      }
+      res.end();
+    }
+    return;
+  }
+
+  // --- Transcript ophalen via proxy (POST) — Cloudflare Tunnel → thuis-PC → YouTube ---
+  if (method === 'POST' && pathname === '/transcript/proxy') {
+    const startTime = Date.now();
+
+    if (!PROXY_URL || !PROXY_API_KEY) {
+      const encodedError = encodeURIComponent('Proxy niet geconfigureerd. Stel PROXY_URL en PROXY_API_KEY in als environment variabelen.');
+      res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
+      res.end();
+      return;
+    }
+
+    try {
+      const snippets = await fetchTranscriptViaProxy(
+        TRANSCRIPT_VIDEO_ID,
+        PROXY_URL,
+        PROXY_API_KEY,
+      );
+      const durationMs = Date.now() - startTime;
+
+      const fullText = snippets.map((s) => s.text).join(' ');
+      const result: TranscriptResult = {
+        videoId: TRANSCRIPT_VIDEO_ID,
+        title: `Video ${TRANSCRIPT_VIDEO_ID}`,
+        language: 'onbekend',
+        snippets,
+        fullText,
+        approach: 'proxy-relay',
+      };
+
+      // Beperk fullText lengte voor URL parameter
+      const resultForUrl = {
+        ...result,
+        fullText: result.fullText.length > MAX_RESULT_URL_LENGTH
+          ? result.fullText.slice(0, MAX_RESULT_URL_LENGTH) + '\n\n... (tekst ingekort voor weergave)'
+          : result.fullText,
+      };
+
+      const encodedResult = encodeURIComponent(JSON.stringify(resultForUrl));
+      res.writeHead(303, { Location: `/transcript?result=${encodedResult}&meta=${durationMs}` });
+      res.end();
+    } catch (err: unknown) {
+      const durationMs = Date.now() - startTime;
+      if (err instanceof TranscriptError) {
+        console.error(`[transcript/proxy] Error for ${TRANSCRIPT_VIDEO_ID} after ${durationMs}ms: ${err.name} (${err.statusCode}): ${err.message}`);
+        const userMessage = err.message;
+        const encodedError = encodeURIComponent(userMessage);
+        res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
+      } else {
+        console.error(`[transcript/proxy] Unexpected error for ${TRANSCRIPT_VIDEO_ID} after ${durationMs}ms:`, err);
+        const encodedError = encodeURIComponent('Er is een onbekende fout opgetreden bij het ophalen van het transcript via de proxy.');
         res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
       }
       res.end();
