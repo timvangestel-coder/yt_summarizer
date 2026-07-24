@@ -638,6 +638,7 @@ export async function fetchTranscriptViaProxy(
   }
 
   const proxyBase = proxyUrl.replace(/\/+$/, '');
+  console.log(`[transcript/proxy] Using proxy URL: ${proxyBase}`);
   const commonHeaders: Record<string, string> = {
     'x-api-key': apiKey,
     'x-forwarded-host': 'www.youtube.com',
@@ -703,6 +704,14 @@ export async function fetchTranscriptViaProxy(
   } catch {
     throw new TranscriptError('Ongeldige JSON-response van YouTube player API.', 502, videoId);
   }
+
+  // Debug: log response keys om te zien wat YouTube teruggeeft
+  console.log(`[transcript/proxy] Player response keys: ${Object.keys(playerData).join(', ')}`);
+  if (playerData.error) {
+    const errInfo = playerData.error as Record<string, unknown>;
+    console.log(`[transcript/proxy] YouTube API error: ${JSON.stringify(errInfo).slice(0, 300)}`);
+  }
+  console.log(`[transcript/proxy] Has captions: ${'captions' in playerData}`);
 
   // Navigeer: captions → playerCaptionsTracklistRenderer → captionTracks[]
   const captions = playerData.captions as Record<string, unknown> | undefined;
