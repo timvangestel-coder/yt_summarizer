@@ -573,13 +573,83 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         htmlResult = `❌ Fout: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      // Test 4: Directe youtube-transcript package call
-      let packageResult = 'niet geprobeerd';
+      // Test 4: youtubetranscript.com API
+      let yttResult = 'niet geprobeerd';
       try {
-        const segments = await YoutubeTranscript.fetchTranscript(videoId);
-        packageResult = segments ? `✅ ${segments.length} segmenten` : '❌ Geen segmenten';
+        const yttResp = await fetch('https://youtubetranscript.com/?v=' + videoId + '&format=json', {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        });
+        const yttText = await yttResp.text();
+        // Probeer JSON te parsen
+        try {
+          const yttJson = JSON.parse(yttText);
+          if (Array.isArray(yttJson)) {
+            yttResult = `✅ JSON array met ${yttJson.length} items`;
+          } else if (yttJson?.segments) {
+            yttResult = `✅ ${yttJson.segments.length} segmenten`;
+          } else {
+            yttResult = `❌ Onbekend JSON: ${JSON.stringify(yttJson).slice(0, 200)}`;
+          }
+        } catch {
+          const titleMatch = yttText.match(/<title>([^<]+)<\/title>/);
+          const title = titleMatch ? titleMatch[1] : 'onbekend';
+          yttResult = `❌ HTML (${title}) - lengte: ${yttText.length}`;
+        }
       } catch (e: unknown) {
-        packageResult = `❌ ${e instanceof Error ? e.message : String(e)}`;
+        yttResult = `❌ Fout: ${e instanceof Error ? e.message : String(e)}`;
+      }
+
+      // Test 5: captions.list met API key (check of YouTube Data API v3 werkt vanuit cloud)
+      let captionsListResult = 'niet geprobeerd';
+      try {
+        // Gebruik dezelfde OAuth credentials als in de app (leeg = geen)
+        if (YOUTUBE_CLIENT_ID && YOUTUBE_CLIENT_SECRET && YOUTUBE_REFRESH_TOKEN) {
+          // Token verversen
+          const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              client_id: YOUTUBE_CLIENT_ID,
+              client_secret: YOUTUBE_CLIENT_SECRET,
+              refresh_token: YOUTUBE_REFRESH_TOKEN,
+              grant_type: 'refresh_token',
+            }),
+          });
+          const tokenData = await tokenResp.json() as any;
+          if (tokenData?.access_token) {
+            const listResp = await fetch(`https://www.googleapis.com/youtube/v3/captions?part=snippet&videoId=${videoId}`, {
+              headers: { 'Authorization': `Bearer ${tokenData.access_token}` },
+            });
+            const listData = await listResp.json() as any;
+            const tracks = listData?.items;
+            if (tracks?.length) {
+              const track = tracks[0] as any;
+              captionsListResult = `✅ ${tracks.length} tracks - probeer download...`;
+              // Probeer download
+              try {
+                const dlResp = await fetch(`https://www.googleapis.com/youtube/v3/captions/${track.id}?tfmt=sbv`, {
+                  headers: { 'Authorization': `Bearer ${tokenData.access_token}` },
+                });
+                if (dlResp.ok) {
+                  const text = await dlResp.text();
+                  captionsListResult = `✅ ${tracks.length} tracks - DOWNLOAD OK (${text.length} chars)`;
+                } else {
+                  captionsListResult = `✅ ${tracks.length} tracks - download: HTTP ${dlResp.status} ${dlResp.statusText}`;
+                }
+              } catch (e: unknown) {
+                captionsListResult = `✅ ${tracks.length} tracks - download fout: ${e instanceof Error ? e.message : String(e)}`;
+              }
+            } else {
+              captionsListResult = '✅ Token OK, maar geen tracks (geen ondertiteling?)';
+            }
+          } else {
+            captionsListResult = `❌ Token fout: ${JSON.stringify(tokenData).slice(0, 200)}`;
+          }
+        } else {
+          captionsListResult = '⏭️ Geen OAuth credentials geconfigureerd';
+        }
+      } catch (e: unknown) {
+        captionsListResult = `❌ Fout: ${e instanceof Error ? e.message : String(e)}`;
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -588,7 +658,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         innerTubeResult: `ANDROID: ${innerTubeResult}`,
         webInnerTubeResult: `WEB: ${webInnerTubeResult}`,
         htmlResult: `Scrape: ${htmlResult} | ${captionsSummary}`,
-        packageResult,
+        yttResult,
+        captionsListResult,
         nodeVersion: process.version,
       }, null, 2));
       return;
