@@ -248,7 +248,7 @@ function renderTranscriptPage(error?: string, result?: TranscriptResult, duratio
 <body>
   <div class="card" style="max-width: 800px;">
     <h1>🎬 YouTube Transcript</h1>
-    <p>Haal de ondertiteling op van een bekende YouTube-video via de YouTube Data API v3 (OAuth 2.0).</p>
+    <p>Haal de ondertiteling op van een bekende YouTube-video — werkt voor alle publieke video's zonder inloggen.</p>
     <form method="POST" action="/transcript" id="transcript-form">
       <button type="submit" id="submit-btn">📥 Haal transcript op van voorbeeldvideo</button>
     </form>
@@ -419,25 +419,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (method === 'POST' && pathname === '/transcript') {
     const startTime = Date.now();
 
-    // Controleer of OAuth credentials zijn geconfigureerd
-    if (!YOUTUBE_CLIENT_ID || !YOUTUBE_CLIENT_SECRET || !YOUTUBE_REFRESH_TOKEN) {
-      console.error('[transcript] YouTube API credentials not configured. Set YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN.');
-      const encodedError = encodeURIComponent(
-        'YouTube API-credentials zijn niet geconfigureerd. Voer eerst HITL-stappen 1-3 uit: ' +
-        'Google Cloud-project aanmaken, OAuth-client aanmaken en refresh token verkrijgen. ' +
-        'Zie de issue voor instructies.'
-      );
-      res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
-      res.end();
-      return;
-    }
-
     try {
       const result = await getTranscriptYoutubeApi(
         TRANSCRIPT_VIDEO_ID,
-        YOUTUBE_CLIENT_ID,
-        YOUTUBE_CLIENT_SECRET,
-        YOUTUBE_REFRESH_TOKEN,
+        YOUTUBE_CLIENT_ID || '',
+        YOUTUBE_CLIENT_SECRET || '',
+        YOUTUBE_REFRESH_TOKEN || '',
       );
       const durationMs = Date.now() - startTime;
 
