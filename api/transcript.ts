@@ -613,6 +613,11 @@ export async function getTranscriptYoutubeApi(
  * Maakt een InnerTube-request naar de generieke reverse proxy. De proxy
  * routeert via een consumer ISP, waardoor YouTube geen datacenter-IP blokkeert.
  *
+ * Twee-stappen proces:
+ * 1. POST naar /youtubei/v1/player?prettyPrint=false om caption tracks op te halen
+ * 2. GET naar captionTracks[n].baseUrl om de XML-ondertiteling te downloaden
+ * 3. Parse XML naar TranscriptSnippet[]
+ *
  * @param videoId - YouTube video ID
  * @param proxyUrl - Basis-URL van de proxy (bv. https://random.trycloudflare.com)
  * @param apiKey - API-key voor proxy-authenticatie
@@ -632,7 +637,13 @@ export async function fetchTranscriptViaProxy(
     throw new InvalidVideoIdError(videoId);
   }
 
-  // Bouw InnerTube request body (zelfde formaat als youtube-transcript package)
+  const proxyBase = proxyUrl.replace(/\/+$/, '');
+  const commonHeaders: Record<string, string> = {
+    'x-api-key': apiKey,
+    'x-forwarded-host': 'www.youtube.com',
+  };
+
+  // ── Stap 1: POST naar /youtubei/v1/player?prettyPrint=false ──────────
   const innerTubeBody = {
     context: {
       client: {
@@ -646,23 +657,17 @@ export async function fetchTranscriptViaProxy(
     videoId,
   };
 
-  const proxyEndpoint = `${proxyUrl.replace(/\/+$/, '')}/youtubei/v1/transcript/get_transcript`;
-
-  let response: Response;
+  let playerResponse: Response;
   try {
-    // Gebruik fetch() i.p.v. httpsPostJson omdat we de HTTP-statuscode nodig hebben
-    // voor foutdifferentiatie (401 vs 403 vs 502). httpsPostJson geeft alleen een
-    // string-rejectie zonder statuscode.
-    response = await fetch(proxyEndpoint, {
+    playerResponse = await fetch(`${proxyBase}/youtubei/v1/player?prettyPrint=false`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json; charset=utf-8',
-        'x-api-key': apiKey,
-        'x-forwarded-host': 'www.youtube.com',
-        'User-Agent': 'CloudAI-POC/1.0',
+        ...commonHeaders,
+        'User-Agent': 'com.google.android.youtube/20.10.38 (Linux; U; Android 14)',
       },
       body: JSON.stringify(innerTubeBody),
-      signal: AbortSignal.timeout(30000), // 30s timeout
+      signal: AbortSignal.timeout(30000),
     });
   } catch (err) {
     if (err instanceof Error && err.name === 'TimeoutError') {
@@ -675,159 +680,148 @@ export async function fetchTranscriptViaProxy(
     );
   }
 
-  if (!response.ok) {
-    const bodyText = await response.text().catch(() => '');
-    if (response.status === 401) {
+  if (!playerResponse.ok) {
+    const bodyText = await playerResponse.text().catch(() => '');
+    if (playerResponse.status === 401) {
       throw new TranscriptError('Proxy authenticatiefout. Controleer de PROXY_API_KEY.', 502, videoId);
     }
-    if (response.status === 403) {
+    if (playerResponse.status === 403) {
       throw new TranscriptError(
-        `Domein niet toegestaan in proxy whitelist. Controleer de proxy configuratie.`,
+        'Domein niet toegestaan in proxy whitelist. Controleer de proxy configuratie.',
         502,
         videoId,
       );
     }
     throw new TranscriptError(
-      `Proxy fout (HTTP ${response.status}): ${bodyText.slice(0, 200)}`,
+      `Proxy fout (HTTP ${playerResponse.status}): ${bodyText.slice(0, 200)}`,
       502,
       videoId,
     );
   }
 
-  // Parse de InnerTube response
-  let data: unknown;
+  // Parse player response om caption tracks te extraheren
+  let playerData: Record<string, unknown>;
   try {
-    data = await response.json();
+    playerData = (await playerResponse.json()) as Record<string, unknown>;
   } catch {
-    throw new TranscriptError('Ongeldige JSON-response van proxy/YouTube.', 502, videoId);
+    throw new TranscriptError('Ongeldige JSON-response van YouTube player API.', 502, videoId);
   }
 
-  const snippets = parseInnerTubeTranscriptResponse(data, videoId);
-  if (snippets.length === 0) {
+  // Navigeer: captions → playerCaptionsTracklistRenderer → captionTracks[]
+  const captions = playerData.captions as Record<string, unknown> | undefined;
+  if (!captions) {
     throw new TranscriptNotAvailableError(videoId);
   }
-  return snippets;
+  const tracklistRenderer = captions.playerCaptionsTracklistRenderer as Record<string, unknown> | undefined;
+  if (!tracklistRenderer) {
+    throw new TranscriptNotAvailableError(videoId);
+  }
+  const captionTracks = tracklistRenderer.captionTracks as Array<Record<string, unknown>> | undefined;
+  if (!captionTracks || captionTracks.length === 0) {
+    throw new TranscriptNotAvailableError(videoId);
+  }
+
+  // Kies de beste track: NL > opgegeven taal > EN > eerste
+  let selectedTrack: Record<string, unknown> | undefined =
+    captionTracks.find((t) => t.languageCode === 'nl');
+  if (!selectedTrack && lang) {
+    selectedTrack = captionTracks.find((t) => t.languageCode === lang);
+  }
+  if (!selectedTrack) {
+    selectedTrack = captionTracks.find((t) => t.languageCode === 'en');
+  }
+  if (!selectedTrack) {
+    selectedTrack = captionTracks[0];
+  }
+
+  const baseUrl = selectedTrack.baseUrl as string | undefined;
+  if (!baseUrl) {
+    throw new TranscriptError('Geen baseUrl in caption track.', 502, videoId);
+  }
+
+  // ── Stap 2: GET naar baseUrl via proxy ──────────────────────────────
+  const baseUrlObj = new URL(baseUrl);
+  const proxyPath = baseUrlObj.pathname + baseUrlObj.search;
+
+  let transcriptResponse: Response;
+  try {
+    transcriptResponse = await fetch(`${proxyBase}${proxyPath}`, {
+      method: 'GET',
+      headers: {
+        ...commonHeaders,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      signal: AbortSignal.timeout(30000),
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === 'TimeoutError') {
+      throw new TranscriptError('Proxy request timeout (30s) voor transcript download.', 504, videoId);
+    }
+    throw new TranscriptError(
+      `Netwerkfout bij transcript download via proxy: ${err instanceof Error ? err.message : String(err)}`,
+      502,
+      videoId,
+    );
+  }
+
+  if (!transcriptResponse.ok) {
+    throw new TranscriptError(
+      `Transcript download fout (HTTP ${transcriptResponse.status}).`,
+      502,
+      videoId,
+    );
+  }
+
+  const xmlContent = await transcriptResponse.text();
+
+  // ── Stap 3: Parse XML naar TranscriptSnippet[] ──────────────────────
+  return parseTranscriptXml(xmlContent, videoId);
 }
 
 /**
- * Parse een InnerTube transcript-response naar TranscriptSnippet[].
+ * Parse een YouTube transcript XML naar TranscriptSnippet[].
  *
- * InnerTube response-structuur:
- * ```
- * {
- *   "actions": [{
- *     "updateEngagementPanelAction": {
- *       "content": {
- *         "transcriptRenderer": {
- *           "body": {
- *             "transcriptBodyRenderer": {
- *               "cueGroups": [{
- *                 "cues": [{
- *                   "cue": {
- *                     "transcriptCueRenderer": {
- *                       "cue": { "simpleText": "..." },
- *                       "relativeOffsetMs": "1000",
- *                       "durationMs": "2000"
- *                     }
- *                   }
- *                 }]
- *               }]
- *             }
- *           }
- *         }
- *       }
- *     }
- *   }]
- * }
- * ```
+ * Ondersteunt twee formaten:
+ * - srv3: <p t="1200" d="2500">text</p> (t in milliseconden)
+ * - classic: <text start="1.2" dur="2.5">text</text> (t in seconden)
  */
-function parseInnerTubeTranscriptResponse(
-  data: unknown,
-  videoId: string,
-): TranscriptSnippet[] {
-  if (!data || typeof data !== 'object') {
-    throw new TranscriptError('Lege response van InnerTube API.', 502, videoId);
+function parseTranscriptXml(xml: string, videoId: string): TranscriptSnippet[] {
+  const snippets: TranscriptSnippet[] = [];
+
+  // Probeer srv3-formaat: <p t="1200" d="2500">text</p>
+  const srv3Regex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([^<]*)<\/p>/g;
+  let match: RegExpExecArray | null;
+  while ((match = srv3Regex.exec(xml)) !== null) {
+    const startMs = parseInt(match[1], 10);
+    const durationMs = parseInt(match[2], 10);
+    const text = decodeHtmlEntities(match[3].trim());
+    if (text) {
+      snippets.push({
+        text,
+        start: startMs / 1000,
+        duration: durationMs / 1000,
+      });
+    }
   }
 
-  const root = data as Record<string, unknown>;
-  const actions = root.actions;
-  if (!Array.isArray(actions) || actions.length === 0) {
+  // Als geen srv3-matches, probeer classic-formaat: <text start="1.2" dur="2.5">text</text>
+  if (snippets.length === 0) {
+    const classicRegex = /<text\s+start="([\d.]+)"\s+dur="([\d.]+)"[^>]*>([^<]*)<\/text>/g;
+    while ((match = classicRegex.exec(xml)) !== null) {
+      const start = parseFloat(match[1]);
+      const duration = parseFloat(match[2]);
+      const text = decodeHtmlEntities(match[3].trim());
+      if (text) {
+        snippets.push({ text, start, duration });
+      }
+    }
+  }
+
+  if (snippets.length === 0) {
     throw new TranscriptNotAvailableError(videoId);
   }
 
-  // Zoek de transcript-actions
-  for (const action of actions) {
-    if (!action || typeof action !== 'object') continue;
-    const act = action as Record<string, unknown>;
-
-    const updatePanel = act.updateEngagementPanelAction as Record<string, unknown> | undefined;
-    if (!updatePanel) continue;
-
-    const content = updatePanel.content as Record<string, unknown> | undefined;
-    if (!content) continue;
-
-    const transcriptRenderer = content.transcriptRenderer as Record<string, unknown> | undefined;
-    if (!transcriptRenderer) continue;
-
-    const body = transcriptRenderer.body as Record<string, unknown> | undefined;
-    if (!body) continue;
-
-    const transcriptBodyRenderer = body.transcriptBodyRenderer as Record<string, unknown> | undefined;
-    if (!transcriptBodyRenderer) continue;
-
-    const cueGroups = transcriptBodyRenderer.cueGroups;
-    if (!Array.isArray(cueGroups)) continue;
-
-    const snippets: TranscriptSnippet[] = [];
-    for (const group of cueGroups) {
-      if (!group || typeof group !== 'object') continue;
-      const grp = group as Record<string, unknown>;
-      const cues = grp.cues;
-      if (!Array.isArray(cues)) continue;
-
-      for (const cue of cues) {
-        if (!cue || typeof cue !== 'object') continue;
-        const c = cue as Record<string, unknown>;
-        const cueInner = c.cue as Record<string, unknown> | undefined;
-        if (!cueInner) continue;
-
-        const renderer = cueInner.transcriptCueRenderer as Record<string, unknown> | undefined;
-        if (!renderer) continue;
-
-        // Haal tekst op — kan simpleText of runs[] zijn
-        const cueText = renderer.cue as Record<string, unknown> | undefined;
-        let text = '';
-        if (cueText && typeof cueText.simpleText === 'string') {
-          text = cueText.simpleText;
-        } else if (cueText && Array.isArray(cueText.runs)) {
-          text = cueText.runs
-            .map((r: unknown) => {
-              if (r && typeof r === 'object' && 'text' in (r as Record<string, unknown>)) {
-                return (r as Record<string, unknown>).text as string;
-              }
-              return '';
-            })
-            .join('');
-        }
-
-        if (!text) continue;
-
-        const startMs = Number(renderer.relativeOffsetMs) || 0;
-        const durationMs = Number(renderer.durationMs) || 0;
-
-        snippets.push({
-          text,
-          start: startMs / 1000,
-          duration: durationMs / 1000,
-        });
-      }
-    }
-
-    return snippets;
-  }
-
-  // Geen transcript-renderer gevonden
-  throw new TranscriptNotAvailableError(videoId);
+  return snippets;
 }
 
 /**
