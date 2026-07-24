@@ -8,9 +8,10 @@ import {
   TranscriptResult,
   TranscriptSnippet,
   fetchTranscriptViaProxy,
+  parseVideoId,
 } from './transcript.js';
 import { checkConnection, sanitizeError } from './db.js';
-import { runMigration, insertTestResult, getAllTestResults } from './migrate.js';
+import { runMigration, insertTestResult, getAllTestResults, insertSummary, getSummaryById, getSummaryByVideoId } from './migrate.js';
 
 // ── Environment variables ───────────────────────────────────────────
 const APP_PASSWORD = process.env.APP_PASSWORD;
@@ -421,6 +422,155 @@ function renderDbTestPage(props: DbTestPageProps): string {
 </html>`;
 }
 
+// ── Samenvatting pagina ─────────────────────────────────────────────
+
+const SUMMARY_STYLE = `
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; background: #0f172a; color: #e2e8f0;
+    }
+    .card {
+      background: #1e293b; border-radius: 12px; padding: 2.5rem;
+      max-width: 800px; width: 90%; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+    h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+    h2 { font-size: 1.1rem; margin-top: 1.5rem; margin-bottom: 0.5rem; color: #94a3b8; }
+    p, li { color: #94a3b8; line-height: 1.6; }
+    .badge {
+      display: inline-block; margin-top: 1.5rem;
+      background: #334155; padding: 0.4rem 0.8rem; border-radius: 6px;
+      font-size: 0.8rem; color: #cbd5e1;
+    }
+    button {
+      margin-top: 1.5rem; width: 100%; padding: 0.8rem; border: none;
+      border-radius: 8px; background: #3b82f6; color: #fff;
+      font-size: 1rem; cursor: pointer; transition: background 0.2s;
+    }
+    button:hover { background: #2563eb; }
+    button:disabled { background: #475569; cursor: not-allowed; }
+    .result { margin-top: 1.5rem; }
+    .result-box {
+      background: #0f172a; border-radius: 8px; padding: 1rem;
+      margin-top: 0.5rem; white-space: pre-wrap; word-break: break-word;
+      border-left: 4px solid #3b82f6; line-height: 1.6;
+    }
+    .error-box { border-left-color: #ef4444; }
+    .success-box { border-left-color: #22c55e; }
+    .meta {
+      font-size: 0.8rem; color: #64748b; margin-top: 0.5rem;
+    }
+    .spinner {
+      display: inline-block; width: 1rem; height: 1rem;
+      border: 2px solid #64748b; border-top-color: #e2e8f0;
+      border-radius: 50%; animation: spin 0.6s linear infinite;
+      vertical-align: middle; margin-right: 0.4rem;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    label { display: block; margin-top: 1rem; font-size: 0.9rem; color: #94a3b8; }
+    input { width: 100%; padding: 0.6rem; border: 1px solid #334155; border-radius: 6px; background: #0f172a; color: #e2e8f0; font-size: 0.9rem; margin-top: 0.3rem; }
+    a { color: #3b82f6; }
+    .video-meta { font-size: 0.85rem; color: #94a3b8; margin-top: 0.5rem; }
+    .duplicate-note { background: #1e3a5f; color: #93c5fd; padding: 0.6rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
+`;
+
+function renderSummarizePage(props: {
+  error?: string;
+  summaryId?: number;
+  summary?: {
+    id: number;
+    video_id: string;
+    video_url: string;
+    taal: string;
+    snippet_count: number;
+    samenvatting: string;
+    model: string | null;
+    token_usage_total: number | null;
+    duur_ms: number | null;
+    aangemaakt_op: string;
+  };
+  duplicate?: boolean;
+}): string {
+  const { error, summaryId, summary, duplicate } = props;
+
+  // ── Detailweergave ────────────────────────────────────────────────
+  if (summary) {
+    return `<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Samenvatting — Cloud AI POC</title>
+  <style>${SUMMARY_STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>📝 Videosamenvatting</h1>
+    ${duplicate ? '<div class="duplicate-note">ℹ️ Deze video was al eerder samengevat. Het bestaande resultaat wordt getoond.</div>' : ''}
+    <div class="video-meta">
+      <strong>Video ID:</strong> ${escapeHtml(summary.video_id)}<br>
+      <strong>URL:</strong> <a href="${escapeHtml(summary.video_url)}" target="_blank" style="color:#93c5fd;">${escapeHtml(summary.video_url)}</a><br>
+      <strong>Taal:</strong> ${escapeHtml(summary.taal)}<br>
+      <strong>Aantal snippets:</strong> ${summary.snippet_count}<br>
+      <strong>Model:</strong> ${summary.model ? escapeHtml(summary.model) : 'onbekend'}<br>
+      <strong>Tokens:</strong> ${summary.token_usage_total ?? 'onbekend'}<br>
+      <strong>Doorlooptijd:</strong> ${summary.duur_ms ?? 'onbekend'}ms<br>
+      <strong>Opgeslagen:</strong> ${new Date(summary.aangemaakt_op).toLocaleString('nl-NL')}
+    </div>
+
+    <h2>Samenvatting</h2>
+    <div class="result-box success-box">${escapeHtml(summary.samenvatting)}</div>
+
+    <p style="margin-top:1.5rem;text-align:center;">
+      <a href="/summarize">← Nieuwe samenvatting maken</a>
+    </p>
+    <div class="badge">Protected by HTTP Basic Auth</div>
+  </div>
+</body>
+</html>`;
+  }
+
+  // ── Formulierweergave ─────────────────────────────────────────────
+  return `<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Samenvatting maken — Cloud AI POC</title>
+  <style>${SUMMARY_STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>🎬 Videosamenvatting maken</h1>
+    <p>Voer een openbare YouTube-URL in. De applicatie haalt de ondertiteling op, laat DeepSeek een samenvatting maken en slaat het resultaat op.</p>
+
+    <form method="POST" action="/summarize" id="summarize-form">
+      <label for="url">YouTube-URL</label>
+      <input type="url" id="url" name="url" placeholder="https://www.youtube.com/watch?v=..." required>
+
+      <button type="submit" id="submit-btn">📝 Samenvatting maken</button>
+    </form>
+
+    ${summaryId ? `<div class="result"><p style="color:#22c55e;">✅ Samenvatting opgeslagen met ID <strong>${summaryId}</strong></p><p style="margin-top:0.5rem;"><a href="/summarize?id=${summaryId}" style="color:#3b82f6;">Bekijk samenvatting →</a></p></div>` : ''}
+
+    ${error ? `<div class="result"><p style="color:#ef4444;">❌ Fout</p><div class="result-box error-box">${escapeHtml(error)}</div></div>` : ''}
+
+    <div class="badge">Protected by HTTP Basic Auth</div>
+    <p style="margin-top:1rem;text-align:center;"><a href="/">← Terug naar home</a></p>
+  </div>
+
+  <script>
+    document.getElementById('summarize-form')?.addEventListener('submit', function(e) {
+      const btn = document.getElementById('submit-btn');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Bezig met verwerken...';
+    });
+  </script>
+</body>
+</html>`;
+}
+
 /** Lees het volledige request-body als string. */
 async function readBody(req: IncomingMessage): Promise<string> {
   let body = '';
@@ -671,6 +821,206 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // --- Samenvatting pagina (GET) ---
+  if (method === 'GET' && pathname === '/summarize') {
+    const parsedUrl = new URL(url, 'http://localhost');
+    const idParam = parsedUrl.searchParams.get('id');
+    const errorParam = parsedUrl.searchParams.get('error') || undefined;
+    const savedParam = parsedUrl.searchParams.get('saved');
+
+    // Detailweergave bij ?id=
+    if (idParam) {
+      const id = Number(idParam);
+      if (isNaN(id) || id < 1) {
+        res.writeHead(303, { Location: '/summarize?error=' + encodeURIComponent('Ongeldig samenvattings-ID.') });
+        res.end();
+        return;
+      }
+      try {
+        const summary = await getSummaryById(id);
+        if (!summary) {
+          res.writeHead(303, { Location: '/summarize?error=' + encodeURIComponent('Samenvatting niet gevonden.') });
+          res.end();
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderSummarizePage({ summary }));
+        return;
+      } catch (err) {
+        const userMessage = sanitizeError(err);
+        res.writeHead(303, { Location: `/summarize?error=${encodeURIComponent(userMessage)}` });
+        res.end();
+        return;
+      }
+    }
+
+    // Normale formulierweergave
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderSummarizePage({
+      error: errorParam,
+      summaryId: savedParam ? Number(savedParam) : undefined,
+    }));
+    return;
+  }
+
+  // --- Samenvatting verwerken (POST) ---
+  if (method === 'POST' && pathname === '/summarize') {
+    const startTime = Date.now();
+    const requestId = `req_${startTime}_${Math.random().toString(36).slice(2, 8)}`;
+
+    let body: string;
+    try {
+      body = await readBody(req);
+    } catch {
+      res.writeHead(303, { Location: '/summarize?error=' + encodeURIComponent('Fout bij lezen verzoekbody.') });
+      res.end();
+      return;
+    }
+
+    const params = new URLSearchParams(body);
+    const rawUrl = (params.get('url') || '').trim();
+
+    // ── Validatie: URL vereist ──────────────────────────────────────
+    if (!rawUrl) {
+      res.writeHead(303, { Location: '/summarize?error=' + encodeURIComponent('Voer een YouTube-URL in.') });
+      res.end();
+      return;
+    }
+
+    // ── Parse video ID ──────────────────────────────────────────────
+    const videoId = parseVideoId(rawUrl);
+    if (!videoId) {
+      res.writeHead(303, { Location: '/summarize?error=' + encodeURIComponent('Ongeldige YouTube-URL. Geef een geldige openbare YouTube-video-URL op.') });
+      res.end();
+      return;
+    }
+
+    // ── Duplicate detectie ──────────────────────────────────────────
+    try {
+      const existing = await getSummaryByVideoId(videoId);
+      if (existing) {
+        // Bestaande samenvatting tonen, geen nieuwe aanmaken
+        res.writeHead(303, { Location: `/summarize?id=${existing.id}` });
+        res.end();
+        return;
+      }
+    } catch {
+      // Bij databasefout gewoon doorgaan — de insert zal later falen als er een probleem is
+    }
+
+    // ── Stap 1: Transcript ophalen via proxy ────────────────────────
+    let snippets: TranscriptSnippet[];
+    try {
+      if (!PROXY_URL || !PROXY_API_KEY) {
+        throw new Error('Proxy niet geconfigureerd. Stel PROXY_URL en PROXY_API_KEY in.');
+      }
+      snippets = await fetchTranscriptViaProxy(videoId, PROXY_URL, PROXY_API_KEY);
+    } catch (err: unknown) {
+      const durationMs = Date.now() - startTime;
+      console.error(`[summarize] Transcript error for ${videoId} after ${durationMs}ms:`, err instanceof Error ? err.message : String(err));
+      const userMessage = err instanceof TranscriptError
+        ? err.message
+        : (err instanceof Error ? err.message : 'Er is een fout opgetreden bij het ophalen van de ondertiteling.');
+      res.writeHead(303, { Location: `/summarize?error=${encodeURIComponent(userMessage)}` });
+      res.end();
+      return;
+    }
+
+    // ── Stap 2: Samenvatting maken met DeepSeek ─────────────────────
+    const fullText = snippets.map((s) => s.text).join(' ');
+
+    // Input begrenzen: max 100.000 tekens (ruim binnen DeepSeek context)
+    const MAX_INPUT_CHARS = 100_000;
+    const truncatedText = fullText.length > MAX_INPUT_CHARS
+      ? fullText.slice(0, MAX_INPUT_CHARS) + '\n\n[... transcript ingekort wegens lengte]'
+      : fullText;
+
+    const summaryPrompt = `Je krijgt de ondertiteling van een YouTube-video. Vat de video samen in het Nederlands.
+Focus op de hoofdpunten en belangrijkste inzichten.
+Beperk de samenvatting tot maximaal 500 woorden.
+Gebruik duidelijke alinea's.
+
+Ondertiteling:
+${truncatedText}`;
+
+    let deepSeekResult: DeepSeekResult;
+    try {
+      deepSeekResult = await callDeepSeek(summaryPrompt);
+    } catch (err: unknown) {
+      const durationMs = Date.now() - startTime;
+      const deepSeekErr = err as DeepSeekError;
+      console.error(`[summarize] DeepSeek error for ${videoId} after ${durationMs}ms:`, deepSeekErr.category);
+      const userMessage = deepSeekErr.message || 'Er is een fout opgetreden bij het maken van de samenvatting.';
+      res.writeHead(303, { Location: `/summarize?error=${encodeURIComponent(userMessage)}` });
+      res.end();
+      return;
+    }
+
+    // ── Stap 3: Opslaan in PostgreSQL ───────────────────────────────
+    const durationMs = Date.now() - startTime;
+
+    // Zorg dat de tabel bestaat
+    const migResult = await runMigration();
+    if (!migResult.success) {
+      console.error(`[summarize] Migration error: ${migResult.error}`);
+      res.writeHead(303, { Location: `/summarize?error=${encodeURIComponent('Databasefout: ' + migResult.error)}` });
+      res.end();
+      return;
+    }
+
+    try {
+      const newId = await insertSummary({
+        videoId,
+        videoUrl: rawUrl,
+        taal: 'onbekend',
+        snippetCount: snippets.length,
+        transcript: truncatedText.length > 5000 ? truncatedText.slice(0, 5000) + '...' : truncatedText,
+        samenvatting: deepSeekResult.content,
+        model: OPENCODE_MODEL_ID,
+        tokenUsagePrompt: deepSeekResult.tokenUsage.prompt,
+        tokenUsageCompletion: deepSeekResult.tokenUsage.completion,
+        tokenUsageTotal: deepSeekResult.tokenUsage.total,
+        duurMs: durationMs,
+      });
+
+      if (newId === null) {
+        // Duplicate — zou niet moeten gebeuren door check hierboven, maar veiligheidshalve
+        const existing = await getSummaryByVideoId(videoId);
+        if (existing) {
+          res.writeHead(303, { Location: `/summarize?id=${existing.id}` });
+          res.end();
+          return;
+        }
+        // Fallback: toon formulier met saved=0
+        res.writeHead(303, { Location: '/summarize?error=' + encodeURIComponent('Kon samenvatting niet opslaan (mogelijk duplicate).') });
+        res.end();
+        return;
+      }
+
+      // Logging
+      logEntry({
+        time: new Date().toISOString(),
+        requestId,
+        model: OPENCODE_MODEL_ID,
+        durationMs,
+        outcome: 'success',
+        providerStatus: 200,
+        responseLength: deepSeekResult.content.length,
+        tokenUsage: deepSeekResult.tokenUsage,
+      });
+
+      // Redirect naar detailpagina
+      res.writeHead(303, { Location: `/summarize?id=${newId}` });
+      res.end();
+    } catch (err) {
+      const userMessage = sanitizeError(err);
+      console.error(`[summarize] Database error for ${videoId}:`, err);
+      res.writeHead(303, { Location: `/summarize?error=${encodeURIComponent('Opslagfout: ' + userMessage)}` });
+      res.end();
+    }
+    return;
+  }
+
   // --- Root pagina (beveiligd) ---
   if (method === 'GET' && (pathname === '/' || pathname === '')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -689,6 +1039,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     <p style="margin-top:1rem;"><a href="/test-prompt" style="color:#3b82f6;">🧪 Test de DeepSeek-koppeling →</a></p>
     <p style="margin-top:0.5rem;"><a href="/transcript" style="color:#3b82f6;">🎬 YouTube Transcript ophalen →</a></p>
     <p style="margin-top:0.5rem;"><a href="/db-test" style="color:#3b82f6;">🗄️ Database test (Neon PostgreSQL) →</a></p>
+    <p style="margin-top:0.5rem;"><a href="/summarize" style="color:#3b82f6;">📝 Videosamenvatting maken →</a></p>
     <div class="badge">Protected by HTTP Basic Auth</div>
   </div>
 </body>

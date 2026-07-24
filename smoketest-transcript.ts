@@ -1,7 +1,7 @@
 /**
- * Smoketest voor YouTube transcript — Issue 04
+ * Smoketest voor YouTube transcript + samenvatting — Issue 04 + 07
  *
- * Test de proxy relay transcript-implementatie lokaal (zonder Vercel) via tsx.
+ * Test de proxy relay transcript-implementatie en de end-to-end samenvattingsketen.
  * Gebruik: npx tsx smoketest-transcript.ts
  *
  * Testcases:
@@ -10,21 +10,19 @@
  * 3. parseVideoId — raw video ID
  * 4. parseVideoId — ongeldig formaat
  * 5. parseVideoId — ongeldige URL (geen YouTube)
- * 6. fetchTranscriptViaPackage — EN download
- * 7. fetchTranscriptViaPackage — DE fallback
- * 8. fetchTranscriptViaPackage — ongeldige video
+ * 6-8. fetchTranscriptViaProxy — proxy relay tests
  * 9. Ongeldige URL via InvalidVideoIdError
+ * 10-12. Database tests (migrate, CRUD)
+ * 13-15. Samenvatting CRUD tests (insertSummary, getSummaryById, getSummaryByVideoId)
  */
 
 import {
   parseVideoId,
-  fetchTranscriptViaPackage,
+  fetchTranscriptViaProxy,
   TranscriptError,
   TranscriptSnippet,
   InvalidVideoIdError,
   TranscriptNotAvailableError,
-  TranscriptDisabledError,
-  QuotaExceededError,
 } from './api/transcript.js';
 
 // ── Test runner ─────────────────────────────────────────────────────
@@ -53,13 +51,19 @@ async function runTest(name: string, fn: () => Promise<void>, skip = false): Pro
 
 async function main() {
   console.log('='.repeat(60));
-  console.log('🧪 Smoketest — YouTube Transcript (Issue 04)');
+  console.log('🧪 Smoketest — YouTube Transcript + Samenvatting (Issue 04 + 07)');
   console.log(`Datum: ${new Date().toISOString()}`);
-  console.log(`Aanpak: Proxy relay + youtube-transcript package`);
+  console.log(`Aanpak: Proxy relay + Neon PostgreSQL`);
   console.log('='.repeat(60));
   console.log();
 
   const results: TestResult[] = [];
+
+  // ── Proxy config ─────────────────────────────────────────────────
+  const PROXY_URL = process.env.PROXY_URL || '';
+  const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
+  const hasProxy = !!(PROXY_URL && PROXY_API_KEY);
+  const TEST_VIDEO_ID = process.env.TRANSCRIPT_VIDEO_ID || 'jNQXAC9IVRw';
 
   // ── Test 1: parseVideoId — geldige www.youtube.com URL ──────────────────
   results.push(await runTest('parseVideoId — www.youtube.com/watch?v=...', async () => {
@@ -92,9 +96,10 @@ async function main() {
     if (id) throw new Error(`Zou null moeten zijn, kreeg ${id}`);
   }));
 
-  // ── Test 6: fetchTranscriptViaPackage — download EN transcript ──────
-  results.push(await runTest('fetchTranscriptViaPackage — jNQXAC9IVRw EN', async () => {
-    const snippets = await fetchTranscriptViaPackage('jNQXAC9IVRw', 'en');
+  // ── Test 6: fetchTranscriptViaProxy — download via proxy relay ────
+  results.push(await runTest('fetchTranscriptViaProxy — download EN', async () => {
+    if (!hasProxy) throw new Error('PROXY_URL en PROXY_API_KEY niet ingesteld');
+    const snippets = await fetchTranscriptViaProxy(TEST_VIDEO_ID, PROXY_URL, PROXY_API_KEY, 'en');
     if (!snippets || snippets.length === 0) throw new Error('Geen snippets ontvangen');
     console.log(`   Aantal snippets: ${snippets.length}`);
     console.log(`   Eerste: "${snippets[0].text}" @ ${snippets[0].start}s (dur: ${snippets[0].duration}s)`);
@@ -102,20 +107,21 @@ async function main() {
     if (snippets[0].text.length === 0) throw new Error('Eerste snippet is leeg');
     if (snippets[0].start < 0) throw new Error(`Ongeldige start tijd: ${snippets[0].start}`);
     if (snippets[0].duration <= 0) throw new Error(`Ongeldige duration: ${snippets[0].duration}`);
-  }));
+  }, !hasProxy));
 
-  // ── Test 13: fetchTranscriptViaPackage — download DE (valt terug op EN) ─
-  results.push(await runTest('fetchTranscriptViaPackage — jNQXAC9IVRw DE (fallback)', async () => {
-    // DE is beschikbaar, maar test of fallback naar EN werkt als taal niet bestaat
-    const snippets = await fetchTranscriptViaPackage('jNQXAC9IVRw');
+  // ── Test 7: fetchTranscriptViaProxy — zonder taal (fallback) ─────
+  results.push(await runTest('fetchTranscriptViaProxy — zonder taal (fallback)', async () => {
+    if (!hasProxy) throw new Error('PROXY_URL en PROXY_API_KEY niet ingesteld');
+    const snippets = await fetchTranscriptViaProxy(TEST_VIDEO_ID, PROXY_URL, PROXY_API_KEY);
     if (!snippets || snippets.length === 0) throw new Error('Geen snippets ontvangen');
     console.log(`   Aantal snippets: ${snippets.length} (zonder taalopgave)`);
-  }));
+  }, !hasProxy));
 
-  // ── Test 14: fetchTranscriptViaPackage — video zonder ondertiteling ────
-  results.push(await runTest('fetchTranscriptViaPackage — ongeldige video', async () => {
+  // ── Test 8: fetchTranscriptViaProxy — ongeldige video ────────────
+  results.push(await runTest('fetchTranscriptViaProxy — ongeldige video', async () => {
+    if (!hasProxy) throw new Error('PROXY_URL en PROXY_API_KEY niet ingesteld');
     try {
-      await fetchTranscriptViaPackage('zzzzzzzzzzz');
+      await fetchTranscriptViaProxy('zzzzzzzzzzz', PROXY_URL, PROXY_API_KEY);
       throw new Error('Zou een fout moeten geven');
     } catch (err) {
       if (err instanceof TranscriptNotAvailableError || err instanceof TranscriptError) {
@@ -124,12 +130,12 @@ async function main() {
         throw err;
       }
     }
-  }));
+  }, !hasProxy));
 
   // ── Test 9: Ongeldige URL via InvalidVideoIdError ─────────────────────
   results.push(await runTest('Transcript — ongeldige URL', async () => {
     try {
-      await fetchTranscriptViaPackage('geen-geldig-id');
+      await fetchTranscriptViaProxy('geen-geldig-id', PROXY_URL, PROXY_API_KEY);
       throw new Error('Zou een fout moeten geven');
     } catch (err) {
       if (err instanceof InvalidVideoIdError) {
@@ -208,6 +214,90 @@ async function main() {
     console.log(`   ✅ Teruggelezen: "${found.label}" — "${found.resultaat.slice(0, 50)}..."`);
   }, !hasDb));
 
+  // ── Samenvatting CRUD tests ──────────────────────────────────────
+
+  // ── Test 19: insertSummary — nieuwe samenvatting opslaan ─────────
+  results.push(await runTest('samenvatting — insertSummary (nieuw)', async () => {
+    const { insertSummary, getSummaryById } = await import('./api/migrate.js');
+    const videoId = `test${Date.now()}`.slice(0, 11);
+    const id = await insertSummary({
+      videoId,
+      videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      taal: 'nl',
+      snippetCount: 5,
+      transcript: 'Dit is een test transcript.',
+      samenvatting: 'Dit is een test samenvatting.',
+      model: 'deepseek-v4-flash-free',
+      tokenUsagePrompt: 100,
+      tokenUsageCompletion: 50,
+      tokenUsageTotal: 150,
+      duurMs: 1234,
+    });
+    if (id === null) throw new Error('insertSummary retourneerde null (mogelijk duplicate)');
+    if (typeof id !== 'number' || id < 1) throw new Error(`Ongeldig ID: ${id}`);
+    console.log(`   ✅ Opgeslagen met ID: ${id}`);
+
+    // Teruglezen
+    const found = await getSummaryById(id);
+    if (!found) throw new Error(`Samenvatting met ID ${id} niet teruggevonden`);
+    if (found.video_id !== videoId) throw new Error(`video_id mismatch: verwacht ${videoId}, kreeg ${found.video_id}`);
+    if (found.samenvatting !== 'Dit is een test samenvatting.') throw new Error('samenvatting tekst mismatch');
+    console.log(`   ✅ Teruggelezen: video_id=${found.video_id}, samenvatting="${found.samenvatting.slice(0, 40)}..."`);
+  }, !hasDb));
+
+  // ── Test 20: insertSummary — duplicate detectie ──────────────────
+  results.push(await runTest('samenvatting — insertSummary (duplicate)', async () => {
+    const { insertSummary, getSummaryByVideoId } = await import('./api/migrate.js');
+    const videoId = `dup${Date.now()}`.slice(0, 11);
+    // Eerste insert
+    const id1 = await insertSummary({
+      videoId,
+      videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      taal: 'en',
+      snippetCount: 3,
+      transcript: 'Eerste transcript.',
+      samenvatting: 'Eerste samenvatting.',
+      model: 'deepseek-v4-flash-free',
+      tokenUsagePrompt: 50,
+      tokenUsageCompletion: 25,
+      tokenUsageTotal: 75,
+      duurMs: 500,
+    });
+    if (id1 === null) throw new Error('Eerste insert zou moeten slagen');
+    console.log(`   ✅ Eerste insert: ID ${id1}`);
+
+    // Tweede insert (zelfde video_id) moet null retourneren
+    const id2 = await insertSummary({
+      videoId,
+      videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      taal: 'en',
+      snippetCount: 99,
+      transcript: 'Dit mag niet worden opgeslagen.',
+      samenvatting: 'Dit mag niet worden opgeslagen.',
+      model: 'deepseek-v4-flash-free',
+      tokenUsagePrompt: 0,
+      tokenUsageCompletion: 0,
+      tokenUsageTotal: 0,
+      duurMs: 0,
+    });
+    if (id2 !== null) throw new Error(`Tweede insert voor zelfde video_id zou null moeten zijn, kreeg ${id2}`);
+    console.log(`   ✅ Duplicate correct gedetecteerd (null retour)`);
+
+    // getSummaryByVideoId moet de eerste teruggeven
+    const found = await getSummaryByVideoId(videoId);
+    if (!found) throw new Error('getSummaryByVideoId vond niets');
+    if (found.id !== id1) throw new Error(`Verwacht ID ${id1}, kreeg ${found.id}`);
+    console.log(`   ✅ getSummaryByVideoId geeft eerste resultaat: ID ${found.id}`);
+  }, !hasDb));
+
+  // ── Test 21: getSummaryById — niet-bestaand ID ───────────────────
+  results.push(await runTest('samenvatting — getSummaryById (niet bestaand)', async () => {
+    const { getSummaryById } = await import('./api/migrate.js');
+    const found = await getSummaryById(999999999);
+    if (found !== null) throw new Error(`Verwacht null voor niet-bestaand ID, kreeg ID ${found.id}`);
+    console.log('   ✅ Correct: null voor niet-bestaand ID');
+  }, !hasDb));
+
   // ── Resultaten ──────────────────────────────────────────────────
   console.log();
   console.log('='.repeat(60));
@@ -242,13 +332,15 @@ async function main() {
   console.log();
   console.log('**Bevindingen:**');
   if (failed === 0) {
-    console.log('- youtube-transcript package werkt voor publieke video\'s zonder OAuth ✅');
-    console.log('- fetchTranscriptViaPackage(): segmenten met offset, duration, text ✅');
+    console.log('- Proxy relay (fetchTranscriptViaProxy) werkt voor publieke video\'s ✅');
     console.log('- URL-validatie (parseVideoId) werkt voor alle formaten ✅');
     console.log('- Error classes geven correcte HTTP-statuscodes ✅');
     if (hasDb) {
       console.log('- Database runMigration() is idempotent ✅');
       console.log('- insertTestResult() + getAllTestResults() werken ✅');
+      console.log('- insertSummary() + getSummaryById() werken ✅');
+      console.log('- Duplicate detectie (ON CONFLICT DO NOTHING) werkt ✅');
+      console.log('- getSummaryByVideoId() vindt bestaande samenvattingen ✅');
       console.log('- Data blijft bewaard (geverifieerd door smoketest) ✅');
     }
   } else if (failed > 0) {
@@ -261,10 +353,12 @@ async function main() {
   if (failed > 0) {
     console.log('1. Controleer de foutmeldingen hierboven.');
     if (!hasDb) console.log('2. Stel DATABASE_URL in en voer de smoketest opnieuw uit voor database-tests.');
+    if (!hasProxy) console.log('3. Stel PROXY_URL en PROXY_API_KEY in voor transcript-tests.');
   } else {
-    console.log('1. Fase 5 (Vercel → tunnel → proxy → YouTube) is gevalideerd ✅');
+    console.log('1. Issue 04 (YouTube transcript via proxy) is gevalideerd ✅');
     console.log('2. Issue 06 (Neon PostgreSQL opslag) is gevalideerd ✅');
-    console.log('3. Fase 6: NSSM + cloudflared service op PC beneden.');
+    console.log('3. Issue 07 (Samenvatting end-to-end) CRUD is gevalideerd ✅');
+    console.log('4. Deploy naar Vercel en test de /summarize pagina.');
   }
 }
 

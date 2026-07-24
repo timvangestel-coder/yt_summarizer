@@ -25,7 +25,6 @@ let pool: pg.Pool | null = null;
 
 function getConnectionString(): string {
   const url = process.env.DATABASE_URL;
-  console.error('[db] DATABASE_URL present:', !!url, 'length:', url?.length ?? 0, 'prefix:', url ? url.slice(0, 20) + '...' : 'NONE');
   if (!url) {
     throw new DbConfigError('DATABASE_URL is niet geconfigureerd.');
   }
@@ -76,11 +75,6 @@ export async function checkConnection(): Promise<{ ok: true } | { ok: false; err
       client.release();
     }
   } catch (err) {
-    // Debug: log de raw error voor диагностика
-    const rawMessage = err instanceof Error ? err.message : String(err);
-    const rawStack = err instanceof Error ? err.stack : '';
-    console.error('[db] Raw connection error:', rawMessage);
-    console.error('[db] Raw stack:', rawStack);
     return { ok: false, error: sanitizeError(err) };
   }
 }
