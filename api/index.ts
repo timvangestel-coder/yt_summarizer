@@ -480,6 +480,78 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // --- Debug: test youtube-transcript package (tijdelijke diagnose) ---
+  if (method === 'GET' && pathname === '/debug-transcript') {
+    try {
+      const { YoutubeTranscript } = await import('youtube-transcript');
+      const videoId = TRANSCRIPT_VIDEO_ID;
+     
+      // Test 1: InnerTube via www.youtube.com
+      let innerTubeResult = 'niet geprobeerd';
+      try {
+        const fetchFn = globalThis.fetch.bind(globalThis);
+        const resp = await fetchFn('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'com.google.android.youtube/20.10.38 (Linux; U; Android 14)',
+          },
+          body: JSON.stringify({
+            context: {
+              client: { clientName: 'ANDROID', clientVersion: '20.10.38' },
+            },
+            videoId: videoId,
+          }),
+        });
+        const data = await resp.json();
+        const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        innerTubeResult = tracks ? `✅ ${tracks.length} tracks gevonden` : '❌ Geen tracks in response';
+      } catch (e: unknown) {
+        innerTubeResult = `❌ Fout: ${e instanceof Error ? e.message : String(e)}`;
+      }
+
+      // Test 2: HTML scraping
+      let htmlResult = 'niet geprobeerd';
+      try {
+        const ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36,gzip(gfe)';
+        const pageResp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+          headers: { 'User-Agent': ua, 'Accept-Language': 'en-US' },
+        });
+        const html = await pageResp.text();
+        if (html.includes('g-recaptcha')) htmlResult = '❌ CAPTCHA gevonden';
+        else if (html.includes('ytInitialPlayerResponse')) {
+          const start = html.indexOf('ytInitialPlayerResponse');
+          htmlResult = `✅ ytInitialPlayerResponse gevonden op positie ${start}, lengte: ${html.length}`;
+        } else htmlResult = `❌ Geen ytInitialPlayerResponse (pagina lengte: ${html.length})`;
+      } catch (e: unknown) {
+        htmlResult = `❌ Fout: ${e instanceof Error ? e.message : String(e)}`;
+      }
+
+      // Test 3: Directe youtube-transcript package call
+      let packageResult = 'niet geprobeerd';
+      try {
+        const segments = await YoutubeTranscript.fetchTranscript(videoId);
+        packageResult = segments ? `✅ ${segments.length} segmenten` : '❌ Geen segmenten';
+      } catch (e: unknown) {
+        packageResult = `❌ ${e instanceof Error ? e.message : String(e)}`;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        videoId,
+        innerTubeResult,
+        htmlResult,
+        packageResult,
+        nodeVersion: process.version,
+      }, null, 2));
+      return;
+    } catch (e: unknown) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(e) }));
+      return;
+    }
+  }
+
   // --- 404 voor onbekende routes ---
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
