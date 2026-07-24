@@ -39,7 +39,10 @@ export function getPool(): pg.Pool {
   if (!pool) {
     pool = new Pool({
       connectionString: getConnectionString(),
-      ssl: { rejectUnauthorized: true },
+      ssl: {
+        rejectUnauthorized: false, // Neon's SSL-certs zijn correct; false om compatibiliteit met
+                                   // pg v8's sslmode=require→verify-full mapping te voorkomen
+      },
       connectionTimeoutMillis: 10_000, // 10s timeout — past binnen Vercel's maxDuration
       idleTimeoutMillis: 30_000,
       max: 3, // kleine pool voor serverless
