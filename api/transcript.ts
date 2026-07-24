@@ -816,13 +816,13 @@ export async function fetchTranscriptViaProxy(
 function parseTranscriptXml(xml: string, videoId: string): TranscriptSnippet[] {
   const snippets: TranscriptSnippet[] = [];
 
-  // Probeer srv3-formaat: <p t="1200" d="2500">text</p>
-  const srv3Regex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([^<]*)<\/p>/g;
+  // Probeer srv3-formaat: <p t="1200" d="2500">text</p> of <p t="1200" d="2500"><s>text</s></p>
+  const srv3Regex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
   let match: RegExpExecArray | null;
   while ((match = srv3Regex.exec(xml)) !== null) {
     const startMs = parseInt(match[1], 10);
     const durationMs = parseInt(match[2], 10);
-    const text = decodeHtmlEntities(match[3].trim());
+    const text = decodeHtmlEntities(match[3].replace(/<[^>]+>/g, '').trim());
     if (text) {
       snippets.push({
         text,
