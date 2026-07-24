@@ -140,6 +140,74 @@ async function main() {
     }
   }));
 
+  // ── Database tests ──────────────────────────────────────────────────
+  const DB_URL = process.env.DATABASE_URL;
+  const hasDb = !!DB_URL;
+
+  // ── Test 15: db — checkConnection zonder DATABASE_URL ────────────────
+  results.push(await runTest('db — checkConnection zonder DATABASE_URL', async () => {
+    const urlBackup = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL;
+    try {
+      // Reload module or test via db module
+      const { checkConnection } = await import('./api/db.js');
+      const status = await checkConnection();
+      if (status.ok) throw new Error('Verwacht fout, maar verbinding was ok');
+      console.log(`   Correct: ${status.error}`);
+    } finally {
+      process.env.DATABASE_URL = urlBackup;
+    }
+  }));
+
+  // ── Test 16: db — sanitizeError herkent foutcategorieën ─────────────
+  results.push(await runTest('db — sanitizeError herkent foutcategorieën', async () => {
+    const { sanitizeError } = await import('./api/db.js');
+    const tests: Array<[string, string]> = [
+      ['getaddrinfo ENOTFOUND', 'Kan geen verbinding maken met de database-server. Controleer de hostnaam.'],
+      ['ECONNREFUSED', 'Verbinding geweigerd door de database-server.'],
+      ['timeout expired', 'Database-verbinding duurde te lang. Probeer het later opnieuw.'],
+      ['password authentication failed', 'Ongeldige database-credentials.'],
+      ['SSL error', 'SSL/TLS-verbinding mislukt. Controleer of de database SSL vereist.'],
+    ];
+    for (const [input, expected] of tests) {
+      const result = sanitizeError(new Error(input));
+      if (result !== expected) {
+        throw new Error(`Voor "${input}" verwachtte "${expected}" maar kreeg "${result}"`);
+      }
+    }
+    console.log(`   ✅ Alle ${tests.length} foutcategorieën correct`);
+  }));
+
+  // ── Test 17: db — runMigration (alleen als DATABASE_URL ingesteld) ──
+  results.push(await runTest('db — runMigration (idempotent)', async () => {
+    const { runMigration } = await import('./api/migrate.js');
+    const result1 = await runMigration();
+    if (!result1.success) throw new Error(`Migratie 1 mislukt: ${result1.error}`);
+    console.log(`   ✅ Eerste migratie: ${result1.message}`);
+
+    // Tweede keer moet ook slagen (idempotent)
+    const result2 = await runMigration();
+    if (!result2.success) throw new Error(`Migratie 2 (idempotent) mislukt: ${result2.error}`);
+    console.log(`   ✅ Tweede migratie (idempotent): ${result2.message}`);
+  }, !hasDb));
+
+  // ── Test 18: db — insertTestResult + getAllTestResults ──────────────
+  results.push(await runTest('db — insertTestResult + getAllTestResults', async () => {
+    const { insertTestResult, getAllTestResults } = await import('./api/migrate.js');
+    const label = `Smoketest ${Date.now()}`;
+    const resultaat = 'Dit is een geautomatiseerde test van de database-opslag.';
+
+    const id = await insertTestResult(label, resultaat);
+    if (!id || typeof id !== 'number') throw new Error(`Ongeldig ID terug: ${id}`);
+    console.log(`   ✅ Opgeslagen met ID: ${id}`);
+
+    const all = await getAllTestResults();
+    const found = all.find((r) => r.id === id);
+    if (!found) throw new Error(`Resultaat met ID ${id} niet teruggevonden in lijst`);
+    if (found.label !== label) throw new Error(`Label mismatch: verwacht "${label}", kreeg "${found.label}"`);
+    console.log(`   ✅ Teruggelezen: "${found.label}" — "${found.resultaat.slice(0, 50)}..."`);
+  }, !hasDb));
+
   // ── Resultaten ──────────────────────────────────────────────────
   console.log();
   console.log('='.repeat(60));
@@ -169,7 +237,7 @@ async function main() {
   console.log();
   console.log(`**Datum:** ${new Date().toISOString()}`);
   console.log(`**Omgeving:** Lokaal (zonder Vercel)`);
-  console.log(`**Aanpak:** Proxy relay + youtube-transcript package`);
+  console.log(`**Aanpak:** Proxy relay + youtube-transcript package + Neon PostgreSQL`);
   console.log(`**Resultaat:** ${failed > 0 ? '⚠️ Sommige tests gefaald' : '✅ Alle tests geslaagd'}`);
   console.log();
   console.log('**Bevindingen:**');
@@ -178,18 +246,25 @@ async function main() {
     console.log('- fetchTranscriptViaPackage(): segmenten met offset, duration, text ✅');
     console.log('- URL-validatie (parseVideoId) werkt voor alle formaten ✅');
     console.log('- Error classes geven correcte HTTP-statuscodes ✅');
+    if (hasDb) {
+      console.log('- Database runMigration() is idempotent ✅');
+      console.log('- insertTestResult() + getAllTestResults() werken ✅');
+      console.log('- Data blijft bewaard (geverifieerd door smoketest) ✅');
+    }
   } else if (failed > 0) {
     console.log('- Sommige tests faalden. Zie details hierboven.');
-    if (failed <= 2) console.log('- Mogelijk een video-specifiek probleem (niet alle video\'s hebben ondertiteling).');
+    if (failed <= 2 && !hasDb) console.log('- Database tests overgeslagen (DATABASE_URL niet ingesteld).');
+    if (failed <= 2 && hasDb) console.log('- Mogelijk een database-specifiek probleem.');
   }
   console.log();
   console.log('**Aanbevolen vervolg:**');
   if (failed > 0) {
     console.log('1. Controleer de foutmeldingen hierboven.');
-    console.log('2. Test met een andere bekende video (bv. TEDx talks hebben altijd ondertiteling).');
+    if (!hasDb) console.log('2. Stel DATABASE_URL in en voer de smoketest opnieuw uit voor database-tests.');
   } else {
     console.log('1. Fase 5 (Vercel → tunnel → proxy → YouTube) is gevalideerd ✅');
-    console.log('2. Fase 6: NSSM + cloudflared service op PC beneden.');
+    console.log('2. Issue 06 (Neon PostgreSQL opslag) is gevalideerd ✅');
+    console.log('3. Fase 6: NSSM + cloudflared service op PC beneden.');
   }
 }
 

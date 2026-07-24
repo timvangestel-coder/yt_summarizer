@@ -9,6 +9,8 @@ import {
   TranscriptSnippet,
   fetchTranscriptViaProxy,
 } from './transcript.js';
+import { checkConnection, sanitizeError } from './db.js';
+import { runMigration, insertTestResult, getAllTestResults } from './migrate.js';
 
 // ── Environment variables ───────────────────────────────────────────
 const APP_PASSWORD = process.env.APP_PASSWORD;
@@ -304,6 +306,121 @@ function renderTranscriptPage(error?: string, result?: TranscriptResult, duratio
 </html>`;
 }
 
+// ── Database test pagina ────────────────────────────────────────────
+
+interface DbTestPageProps {
+  dbStatus?: { ok: true } | { ok: false; error: string };
+  results?: Array<{ id: number; label: string; resultaat: string; aangemaakt_op: string }>;
+  savedId?: number;
+  error?: string;
+  migrateResult?: string;
+}
+
+function renderDbTestPage(props: DbTestPageProps): string {
+  const { dbStatus, results, savedId, error, migrateResult } = props;
+
+  const statusIcon = dbStatus
+    ? dbStatus.ok
+      ? '✅ Verbonden'
+      : `❌ Fout: ${escapeHtml(dbStatus.error)}`
+    : '⏳ Niet gecontroleerd';
+
+  const resultsRows = results && results.length > 0
+    ? results.map((r) => `
+            <tr>
+              <td style="padding:0.4rem 0.6rem;color:#64748b;font-size:0.85rem;">${r.id}</td>
+              <td style="padding:0.4rem 0.6rem;color:#e2e8f0;">${escapeHtml(r.label)}</td>
+              <td style="padding:0.4rem 0.6rem;color:#94a3b8;font-size:0.9rem;">${escapeHtml(r.resultaat)}</td>
+              <td style="padding:0.4rem 0.6rem;color:#64748b;font-size:0.85rem;white-space:nowrap;">${new Date(r.aangemaakt_op).toLocaleString('nl-NL')}</td>
+            </tr>`).join('')
+    : '<tr><td colspan="4" style="padding:1rem;text-align:center;color:#64748b;">Nog geen testresultaten opgeslagen.</td></tr>';
+
+  return `<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🗄️ Database test — Cloud AI POC</title>
+  <style>${PAGE_STYLE}
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+    tr:nth-child(even) { background: #0f172a; }
+    th { padding: 0.5rem; text-align: left; color: #94a3b8; font-size: 0.85rem; }
+    td { padding: 0.4rem 0.6rem; }
+    label { display: block; margin-top: 1rem; font-size: 0.9rem; color: #94a3b8; }
+    input, textarea { width: 100%; padding: 0.6rem; border: 1px solid #334155; border-radius: 6px; background: #0f172a; color: #e2e8f0; font-size: 0.9rem; margin-top: 0.3rem; }
+    textarea { min-height: 80px; resize: vertical; font-family: inherit; }
+    .status-bar { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
+    .status-ok { background: #064e3b; color: #6ee7b7; }
+    .status-fail { background: #450a0a; color: #fca5a5; }
+    .status-idle { background: #1e293b; color: #94a3b8; }
+    .success-msg { background: #064e3b; color: #6ee7b7; padding: 0.6rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.9rem; }
+    .btn-row { display: flex; gap: 0.5rem; margin-top: 1.5rem; }
+    .btn-row button { flex: 1; }
+    .btn-secondary { background: #475569; }
+    .btn-secondary:hover { background: #64748b; }
+    a { color: #3b82f6; }
+  </style>
+</head>
+<body>
+  <div class="card" style="max-width: 800px;">
+    <h1>🗄️ Database test</h1>
+    <p>Test de Neon PostgreSQL-opslag. Resultaten blijven bewaard na herstart en redeploy.</p>
+
+    <div class="status-bar ${dbStatus ? (dbStatus.ok ? 'status-ok' : 'status-fail') : 'status-idle'}">
+      <span>${statusIcon}</span>
+    </div>
+
+    ${savedId ? `<div class="success-msg">✅ Testresultaat opgeslagen met ID <strong>${savedId}</strong>. Het blijft zichtbaar na herstart/redeploy.</div>` : ''}
+    ${error ? `<div class="result"><p style="color:#ef4444;">❌ Fout</p><div class="result-box error-box">${escapeHtml(error)}</div></div>` : ''}
+    ${migrateResult ? `<div class="success-msg">🗄️ ${escapeHtml(migrateResult)}</div>` : ''}
+
+    <form method="POST" action="/db-test" id="db-form">
+      <label for="label">Label</label>
+      <input type="text" id="label" name="label" placeholder="Bijv. Deploy #3" required>
+
+      <label for="resultaat">Resultaat</label>
+      <textarea id="resultaat" name="resultaat" placeholder="Beschrijving van het testresultaat..." required></textarea>
+
+      <div class="btn-row">
+        <button type="submit" id="submit-db-btn">💾 Opslaan</button>
+        <button type="submit" name="migrate" value="1" class="btn-secondary" id="migrate-btn">🗄️ Voer migratie uit</button>
+      </div>
+    </form>
+
+    <div style="margin-top: 2rem;">
+      <h2 style="font-size: 1.1rem; margin-bottom: 0.5rem;">📋 Opgeslagen testresultaten</h2>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr style="background:#1e293b;">
+              <th>ID</th>
+              <th>Label</th>
+              <th>Resultaat</th>
+              <th>Opgeslagen</th>
+            </tr>
+          </thead>
+          <tbody>${resultsRows}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="badge">Protected by HTTP Basic Auth</div>
+    <p style="margin-top:1rem;text-align:center;"><a href="/">← Terug naar home</a></p>
+  </div>
+
+  <script>
+    document.getElementById('db-form')?.addEventListener('submit', function(e) {
+      const submitBtn = document.getElementById('submit-db-btn');
+      const migrateBtn = document.getElementById('migrate-btn');
+      const activeBtn = e.submitter === migrateBtn ? migrateBtn : submitBtn;
+      activeBtn.disabled = true;
+      activeBtn.innerHTML = '<span class="spinner"></span> Bezig...';
+    });
+  </script>
+</body>
+</html>`;
+}
+
 function escapeHtml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -479,6 +596,71 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
+  // --- Database test pagina (GET) ---
+  if (method === 'GET' && pathname === '/db-test') {
+    const dbStatus = await checkConnection();
+    const results = dbStatus.ok ? await getAllTestResults().catch(() => []) : [];
+    const savedId = url.includes('saved=') ? Number(new URL(url, 'http://localhost').searchParams.get('saved')) : undefined;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderDbTestPage({ dbStatus, results, savedId }));
+    return;
+  }
+
+  // --- Database test verwerken (POST) ---
+  if (method === 'POST' && pathname === '/db-test') {
+    let body = '';
+    try {
+      for await (const chunk of req) {
+        body += chunk;
+      }
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Fout bij lezen verzoekbody.' }));
+      return;
+    }
+
+    const params = new URLSearchParams(body);
+    const label = params.get('label') || '';
+    const resultaat = params.get('resultaat') || '';
+    const runMigrate = params.get('migrate') === '1';
+
+    if (runMigrate) {
+      const migResult = await runMigration();
+      if (migResult.success) {
+        res.writeHead(303, { Location: `/db-test?migrate=${encodeURIComponent(migResult.message)}` });
+      } else {
+        res.writeHead(303, { Location: `/db-test?error=${encodeURIComponent(migResult.error)}` });
+      }
+      res.end();
+      return;
+    }
+
+    if (!label || !resultaat) {
+      res.writeHead(303, { Location: '/db-test?error=' + encodeURIComponent('Vul zowel een label als een resultaat in.') });
+      res.end();
+      return;
+    }
+
+    try {
+      // Zorg dat de tabel bestaat
+      const migResult = await runMigration();
+      if (!migResult.success) {
+        res.writeHead(303, { Location: `/db-test?error=${encodeURIComponent(migResult.error)}` });
+        res.end();
+        return;
+      }
+
+      const id = await insertTestResult(label, resultaat);
+      res.writeHead(303, { Location: `/db-test?saved=${id}` });
+      res.end();
+    } catch (err) {
+      const userMessage = sanitizeError(err);
+      res.writeHead(303, { Location: `/db-test?error=${encodeURIComponent(userMessage)}` });
+      res.end();
+    }
+    return;
+  }
+
   // --- Root pagina (beveiligd) ---
   if (method === 'GET' && (pathname === '/' || pathname === '')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -496,6 +678,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     <p>De beveiligde POC-webapp draait op Vercel. Basic Auth is actief.</p>
     <p style="margin-top:1rem;"><a href="/test-prompt" style="color:#3b82f6;">🧪 Test de DeepSeek-koppeling →</a></p>
     <p style="margin-top:0.5rem;"><a href="/transcript" style="color:#3b82f6;">🎬 YouTube Transcript ophalen →</a></p>
+    <p style="margin-top:0.5rem;"><a href="/db-test" style="color:#3b82f6;">🗄️ Database test (Neon PostgreSQL) →</a></p>
     <div class="badge">Protected by HTTP Basic Auth</div>
   </div>
 </body>
