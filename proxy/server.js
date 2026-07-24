@@ -124,7 +124,8 @@ function handleRequest(clientReq, clientRes) {
 
   // --- Bouw target URL ---
   const targetBase = domainConfig.target.replace(/\/+$/, '');
-  const targetPath = pathname.startsWith('/') ? pathname : `/${pathname}`;
+  const pathOnly = pathname.includes('?') ? pathname.slice(0, pathname.indexOf('?')) : pathname;
+  const targetPath = pathOnly.startsWith('/') ? pathOnly : `/${pathOnly}`;
   const queryString = clientReq.url && clientReq.url.includes('?') ? clientReq.url.slice(clientReq.url.indexOf('?')) : '';
   const targetUrl = `${targetBase}${targetPath}${queryString}`;
 

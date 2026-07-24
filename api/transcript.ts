@@ -648,10 +648,7 @@ export async function fetchTranscriptViaProxy(
     context: {
       client: {
         clientName: 'ANDROID',
-        clientVersion: '19.09.37',
-        hl: lang || 'en',
-        gl: 'US',
-        androidSdkVersion: 31,
+        clientVersion: '20.10.38',
       },
     },
     videoId,
