@@ -486,7 +486,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       const { YoutubeTranscript } = await import('youtube-transcript');
       const videoId = TRANSCRIPT_VIDEO_ID;
      
-      // Test 1: InnerTube via www.youtube.com
+      // Test 1: InnerTube via www.youtube.com (ANDROID client)
       let innerTubeResult = 'niet geprobeerd';
       try {
         const fetchFn = globalThis.fetch.bind(globalThis);
@@ -505,29 +505,75 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         });
         const data = await resp.json();
         const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-        innerTubeResult = tracks ? `✅ ${tracks.length} tracks gevonden` : '❌ Geen tracks in response';
+        innerTubeResult = tracks ? `✅ ${tracks.length} tracks: ${tracks.map((t: any) => t.languageCode).join(', ')}` : '❌ Geen tracks in response';
       } catch (e: unknown) {
         innerTubeResult = `❌ Fout: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      // Test 2: HTML scraping
+      // Test 2: InnerTube via www.youtube.com (WEB client)
+      let webInnerTubeResult = 'niet geprobeerd';
+      try {
+        const resp = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          },
+          body: JSON.stringify({
+            context: {
+              client: { clientName: 'WEB', clientVersion: '2.20250224.00.00' },
+            },
+            videoId: videoId,
+          }),
+        });
+        const data = await resp.json();
+        const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        webInnerTubeResult = tracks ? `✅ ${tracks.length} tracks: ${tracks.map((t: any) => t.languageCode).join(', ')}` : '❌ Geen tracks in response';
+      } catch (e: unknown) {
+        webInnerTubeResult = `❌ Fout: ${e instanceof Error ? e.message : String(e)}`;
+      }
+
+      // Test 3: HTML scraping — parse ytInitialPlayerResponse
       let htmlResult = 'niet geprobeerd';
+      let captionsSummary = '';
       try {
         const ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36,gzip(gfe)';
         const pageResp = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
           headers: { 'User-Agent': ua, 'Accept-Language': 'en-US' },
         });
         const html = await pageResp.text();
-        if (html.includes('g-recaptcha')) htmlResult = '❌ CAPTCHA gevonden';
-        else if (html.includes('ytInitialPlayerResponse')) {
-          const start = html.indexOf('ytInitialPlayerResponse');
-          htmlResult = `✅ ytInitialPlayerResponse gevonden op positie ${start}, lengte: ${html.length}`;
-        } else htmlResult = `❌ Geen ytInitialPlayerResponse (pagina lengte: ${html.length})`;
+        if (html.includes('g-recaptcha')) {
+          htmlResult = '❌ CAPTCHA gevonden';
+        } else {
+          const startToken = 'ytInitialPlayerResponse = ';
+          const startIdx = html.indexOf(startToken);
+          if (startIdx === -1) {
+            htmlResult = '❌ Geen ytInitialPlayerResponse';
+          } else {
+            const jsonStart = startIdx + startToken.length;
+            let depth = 0, endIdx = jsonStart;
+            for (let i = jsonStart; i < html.length; i++) {
+              if (html[i] === '{') depth++;
+              else if (html[i] === '}') { depth--; if (depth === 0) { endIdx = i + 1; break; } }
+            }
+            const jsonStr = html.slice(jsonStart, endIdx);
+            const parsed = JSON.parse(jsonStr);
+            const captions = parsed?.captions?.playerCaptionsTracklistRenderer;
+            const tracks = captions?.captionTracks;
+            htmlResult = tracks?.length ? `✅ ${tracks.length} tracks: ${tracks.map((t: any) => t.languageCode + '/' + (t.kind || 'std')).join(', ')}` : '❌ Geen captionTracks in ytInitialPlayerResponse';
+            if (captions) {
+              const audioTracks = captions?.audioTracks?.length || 0;
+              captionsSummary = `audioTracks: ${audioTracks}, captionTracks: ${tracks?.length || 0}`;
+            } else {
+              captionsSummary = 'geen playerCaptionsTracklistRenderer';
+            }
+          }
+        }
       } catch (e: unknown) {
         htmlResult = `❌ Fout: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      // Test 3: Directe youtube-transcript package call
+      // Test 4: Directe youtube-transcript package call
       let packageResult = 'niet geprobeerd';
       try {
         const segments = await YoutubeTranscript.fetchTranscript(videoId);
@@ -539,8 +585,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         videoId,
-        innerTubeResult,
-        htmlResult,
+        innerTubeResult: `ANDROID: ${innerTubeResult}`,
+        webInnerTubeResult: `WEB: ${webInnerTubeResult}`,
+        htmlResult: `Scrape: ${htmlResult} | ${captionsSummary}`,
         packageResult,
         nodeVersion: process.version,
       }, null, 2));
