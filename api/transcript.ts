@@ -730,7 +730,6 @@ export async function fetchTranscriptViaProxy(
       console.log(`[transcript/proxy] NO playerCaptionsTracklistRenderer in captions`);
     }
   }
-  const captions = playerData.captions as Record<string, unknown> | undefined;
   if (!captions) {
     throw new TranscriptNotAvailableError(videoId);
   }
