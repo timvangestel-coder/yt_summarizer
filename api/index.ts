@@ -7,7 +7,6 @@ import {
   TranscriptError,
   TranscriptResult,
   TranscriptSnippet,
-  getTranscriptYoutubeApi,
   fetchTranscriptViaProxy,
 } from './transcript.js';
 
@@ -21,9 +20,6 @@ const LLM_TIMEOUT_MS = LLM_TIMEOUT_SECONDS * 1000;
 const TEST_PROMPT = process.env.TEST_PROMPT || 'Vat in één zin samen wat een REST API is.';
 const MAX_RESULT_URL_LENGTH = 1500; // max chars voor result in query parameter
 const TRANSCRIPT_VIDEO_ID = process.env.TRANSCRIPT_VIDEO_ID || 'jNQXAC9IVRw';
-const YOUTUBE_CLIENT_ID = process.env.YOUTUBE_CLIENT_ID || '';
-const YOUTUBE_CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET || '';
-const YOUTUBE_REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN || '';
 const PROXY_URL = process.env.PROXY_URL || '';
 const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
 
@@ -253,9 +249,6 @@ function renderTranscriptPage(error?: string, result?: TranscriptResult, duratio
     <h1>🎬 YouTube Transcript</h1>
     <p>Haal de ondertiteling op van een bekende YouTube-video — werkt voor alle publieke video's zonder inloggen.</p>
     <div style="display:flex;flex-direction:column;gap:0.5rem;margin-top:1rem;">
-      <form method="POST" action="/transcript" id="transcript-form">
-        <button type="submit" id="submit-btn" style="background:#3b82f6;">📥 Haal transcript op (youtube-transcript)</button>
-      </form>
       <form method="POST" action="/transcript/proxy" id="transcript-proxy-form">
         <button type="submit" id="submit-proxy-btn" style="background:#8b5cf6;">📡 Via thuis-proxy</button>
       </form>
@@ -426,47 +419,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(renderTranscriptPage(errorParam));
-    return;
-  }
-
-  // --- Transcript ophalen (POST) — YouTube Data API v3 ---
-  if (method === 'POST' && pathname === '/transcript') {
-    const startTime = Date.now();
-
-    try {
-      const result = await getTranscriptYoutubeApi(
-        TRANSCRIPT_VIDEO_ID,
-        YOUTUBE_CLIENT_ID || '',
-        YOUTUBE_CLIENT_SECRET || '',
-        YOUTUBE_REFRESH_TOKEN || '',
-      );
-      const durationMs = Date.now() - startTime;
-
-      // Beperk fullText lengte voor URL parameter
-      const resultForUrl = {
-        ...result,
-        fullText: result.fullText.length > MAX_RESULT_URL_LENGTH
-          ? result.fullText.slice(0, MAX_RESULT_URL_LENGTH) + '\n\n... (tekst ingekort voor weergave)'
-          : result.fullText,
-      };
-
-      const encodedResult = encodeURIComponent(JSON.stringify(resultForUrl));
-      res.writeHead(303, { Location: `/transcript?result=${encodedResult}&meta=${durationMs}` });
-      res.end();
-    } catch (err: unknown) {
-      const durationMs = Date.now() - startTime;
-      if (err instanceof TranscriptError) {
-        console.error(`[transcript] Error for ${TRANSCRIPT_VIDEO_ID} after ${durationMs}ms: ${err.name} (${err.statusCode}): ${err.message}`);
-        const userMessage = err.message;
-        const encodedError = encodeURIComponent(userMessage);
-        res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
-      } else {
-        console.error(`[transcript] Unexpected error for ${TRANSCRIPT_VIDEO_ID} after ${durationMs}ms:`, err);
-        const encodedError = encodeURIComponent('Er is een onbekende fout opgetreden bij het ophalen van het transcript.');
-        res.writeHead(303, { Location: `/transcript?error=${encodedError}` });
-      }
-      res.end();
-    }
     return;
   }
 

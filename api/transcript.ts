@@ -1,21 +1,14 @@
 /**
- * YouTube Transcript — Hybride aanpak (PoC)
+ * YouTube Transcript — Proxy relay (PoC)
  *
- * Haalt ondertiteling op van publieke YouTube-video's zonder dat
- * de video-eigenaar hoeft te zijn. Combineert twee methodes:
+ * Haalt ondertiteling op van publieke YouTube-video's via een
+ * reverse proxy (Cloudflare Tunnel → thuis-PC → YouTube).
  *
- * 1. **YouTube Data API v3 (OAuth 2.0)** — captions.list voor taaldetectie
- *    (werkt vanuit elke omgeving via googleapis.com)
- * 2. **youtube-transcript package** — daadwerkelijke download via
- *    www.youtube.com (web-infrastructuur, geen IP-blokkade verwacht)
- * 3. **Fallback** — captions.download voor eigen video's (via OAuth)
- *
- * Codeerstijl: zelfde als mtgnews (Node.js https module, regex-based parsing)
+ * Codeerstijl: zelfde als mtgnews (regex-based parsing)
  *
  * @module
  */
 
-import * as https from 'node:https';
 import { YoutubeTranscript } from 'youtube-transcript';
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -24,13 +17,6 @@ export interface TranscriptSnippet {
   text: string;
   start: number;
   duration: number;
-}
-
-export interface CaptionTrack {
-  id: string;
-  languageCode: string;
-  name: string;
-  kind?: string | undefined;
 }
 
 export interface TranscriptResult {
@@ -77,116 +63,11 @@ export class TranscriptDisabledError extends TranscriptError {
   }
 }
 
-export class OAuthError extends TranscriptError {
-  constructor(videoId: string, detail: string) {
-    super(`OAuth-authenticatiefout: ${detail}. Controleer de YouTube API-credentials.`, 502, videoId);
-    this.name = 'OAuthError';
-  }
-}
-
 export class QuotaExceededError extends TranscriptError {
   constructor(videoId: string) {
     super('Het YouTube API-quotum is overschreden. Probeer het later opnieuw.', 429, videoId);
     this.name = 'QuotaExceededError';
   }
-}
-
-// ── HTTPS helpers ───────────────────────────────────────────────────
-
-/**
- * Voer een HTTPS GET-request uit met optionele headers.
- * Volgt redirects (max 5).
- */
-function httpsGet(url: string, headers?: Record<string, string>): Promise<string> {
-  const maxRedirects = 5;
-  let redirectCount = 0;
-
-  const doRequest = (currentUrl: string): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const urlObj = new URL(currentUrl);
-      const options: https.RequestOptions = {
-        hostname: urlObj.hostname,
-        path: urlObj.pathname + urlObj.search,
-        method: 'GET',
-        headers: {
-          'User-Agent': 'CloudAI-POC/1.0',
-          ...headers,
-        },
-      };
-
-      const req = https.request(options, (res) => {
-        const { statusCode, headers: respHeaders } = res;
-        const location = respHeaders['location'] as string | undefined;
-
-        // Volg redirect (max 5)
-        if (statusCode && statusCode >= 300 && statusCode < 400 && location && redirectCount < maxRedirects) {
-          redirectCount++;
-          const redirectUrl = new URL(location, currentUrl).href;
-          resolve(doRequest(redirectUrl));
-          return;
-        }
-
-        const chunks: Buffer[] = [];
-        res.on('data', (chunk: Buffer) => chunks.push(chunk));
-        res.on('end', () => {
-          const body = Buffer.concat(chunks).toString('utf-8');
-          if (statusCode && statusCode >= 400) {
-            reject(new Error(`HTTP ${statusCode}: ${body.slice(0, 300)}`));
-            return;
-          }
-          resolve(body);
-        });
-      });
-
-      req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
-      req.end();
-    });
-  };
-
-  return doRequest(url);
-}
-
-/**
- * Voer een HTTPS POST-request uit met JSON-body en retourneer de geparsde JSON-response.
- */
-function httpsPostJson(url: string, body: unknown, headers?: Record<string, string>): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const jsonBody = JSON.stringify(body);
-    const options: https.RequestOptions = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Content-Length': Buffer.byteLength(jsonBody),
-        'User-Agent': 'CloudAI-POC/1.0',
-        ...headers,
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString('utf-8');
-        const { statusCode } = res;
-        if (statusCode && statusCode >= 400) {
-          reject(new Error(`HTTP ${statusCode}: ${raw.slice(0, 300)}`));
-          return;
-        }
-        try {
-          resolve(JSON.parse(raw));
-        } catch {
-          reject(new Error(`Ongeldige JSON-response (HTTP ${statusCode}): ${raw.slice(0, 200)}`));
-        }
-      });
-    });
-
-    req.on('error', (err) => reject(new Error(`Netwerkfout: ${err.message}`)));
-    req.write(jsonBody);
-    req.end();
-  });
 }
 
 // ── YouTube URL parsing ────────────────────────────────────────────
@@ -207,408 +88,9 @@ export function parseVideoId(url: string): string | null {
   return null;
 }
 
-// ── OAuth 2.0 token management ─────────────────────────────────────
+// ── Proxy relay ────────────────────────────────────────────────────
 
-interface AccessTokenResponse {
-  access_token: string;
-  expires_in: number;
-  token_type: string;
-  scope?: string;
-}
-
-/**
- * Ververs een OAuth 2.0 access token met een refresh token.
- * POST naar https://oauth2.googleapis.com/token met grant_type=refresh_token.
- *
- * @param clientId - OAuth 2.0 Client ID
- * @param clientSecret - OAuth 2.0 Client Secret
- * @param refreshToken - OAuth 2.0 Refresh Token
- * @returns Access token string
- * @throws OAuthError bij ongeldige credentials
- */
-export async function getAccessToken(
-  clientId: string,
-  clientSecret: string,
-  refreshToken: string,
-): Promise<string> {
-  const body = new URLSearchParams({
-    client_id: clientId,
-    client_secret: clientSecret,
-    refresh_token: refreshToken,
-    grant_type: 'refresh_token',
-  });
-
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL('https://oauth2.googleapis.com/token');
-    const bodyStr = body.toString();
-    const options: https.RequestOptions = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(bodyStr),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString('utf-8');
-        const { statusCode } = res;
-
-        if (statusCode === 400) {
-          let detail = 'Ongeldige refresh token of client credentials';
-          try {
-            const errResp = JSON.parse(raw);
-            if (errResp.error_description) detail = errResp.error_description;
-          } catch { /* ignore parse errors */ }
-          reject(new OAuthError('', detail));
-          return;
-        }
-
-        if (statusCode && statusCode >= 400) {
-          reject(new OAuthError('', `HTTP ${statusCode} van OAuth-endpoint`));
-          return;
-        }
-
-        try {
-          const data: AccessTokenResponse = JSON.parse(raw);
-          if (!data.access_token) {
-            reject(new OAuthError('', 'Geen access_token in OAuth-response'));
-            return;
-          }
-          resolve(data.access_token);
-        } catch {
-          reject(new OAuthError('', 'Ongeldige JSON van OAuth-endpoint'));
-        }
-      });
-    });
-
-    req.on('error', (err) => reject(new OAuthError('', `Netwerkfout: ${err.message}`)));
-    req.write(bodyStr);
-    req.end();
-  });
-}
-
-// ── YouTube Data API v3 helpers ────────────────────────────────────
-
-/**
- * Haal beschikbare caption tracks op voor een video via captions.list.
- *
- * @param videoId - YouTube video ID
- * @param accessToken - Geldig OAuth 2.0 access token
- * @returns Array van CaptionTrack objecten
- * @throws TranscriptNotAvailableError bij geen tracks
- * @throws OAuthError bij authenticatiefout
- * @throws QuotaExceededError bij quota overschrijding
- */
-export async function fetchCaptionTracks(videoId: string, accessToken: string): Promise<CaptionTrack[]> {
-  const url = `https://www.googleapis.com/youtube/v3/captions?part=snippet&videoId=${encodeURIComponent(videoId)}`;
-
-  let body: string;
-  try {
-    body = await httpsGet(url, {
-      'Authorization': `Bearer ${accessToken}`,
-      'Accept': 'application/json',
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Onbekende fout';
-    if (message.includes('HTTP 401') || message.includes('HTTP 403')) {
-      throw new OAuthError(videoId, 'Toegang geweigerd. Mogelijk ongeldig token of onvoldoende rechten.');
-    }
-    if (message.includes('HTTP 429')) {
-      throw new QuotaExceededError(videoId);
-    }
-    throw new TranscriptError(`Fout bij ophalen caption tracks: ${message}`, 502, videoId);
-  }
-
-  let data: { items?: Array<Record<string, unknown>> };
-  try {
-    data = JSON.parse(body);
-  } catch {
-    throw new TranscriptError('Ongeldige response van YouTube API', 502, videoId);
-  }
-
-  if (!data.items || data.items.length === 0) {
-    throw new TranscriptNotAvailableError(videoId);
-  }
-
-  const tracks: CaptionTrack[] = data.items.map((item) => {
-    const snippet = (item.snippet ?? {}) as Record<string, unknown>;
-    return {
-      id: String(item.id ?? ''),
-      languageCode: String(snippet.language ?? ''),
-      name: String(snippet.name ?? ''),
-      kind: snippet.trackKind as string | undefined,
-    };
-  });
-
-  return tracks;
-}
-
-/**
- * Download een caption track in SubViewer-formaat via captions.download.
- *
- * @param captionId - Caption track ID
- * @param accessToken - Geldig OAuth 2.0 access token
- * @returns SBV-content als string
- * @throws OAuthError bij authenticatiefout
- * @deprecated Alleen voor eigen video's. Gebruik fetchTranscriptViaPackage voor publieke video's.
- */
-export async function downloadCaption(captionId: string, accessToken: string): Promise<string> {
-  const url = `https://www.googleapis.com/youtube/v3/captions/${encodeURIComponent(captionId)}?tfmt=sbv`;
-
-  try {
-    return await httpsGet(url, {
-      'Authorization': `Bearer ${accessToken}`,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Onbekende fout';
-    if (message.includes('HTTP 401') || message.includes('HTTP 403')) {
-      throw new OAuthError('', 'Toegang geweigerd bij downloaden ondertiteling.');
-    }
-    if (message.includes('HTTP 404')) {
-      throw new TranscriptError('Ondertiteling niet gevonden (caption track ID ongeldig).', 404, '');
-    }
-    throw new TranscriptError(`Fout bij downloaden ondertiteling: ${message}`, 502, '');
-  }
-}
-
-/**
- * Download een transcript via de youtube-transcript package.
- *
- * Werkt voor alle publieke YouTube-video's zonder dat de gebruiker
- * video-eigenaar hoeft te zijn. Maakt gebruik van de www.youtube.com
- * web-infrastructuur (niet googleapis.com), waardoor IP-blokkades
- * vanuit cloud-omgevingen onwaarschijnlijker zijn.
- *
- * @param videoId - YouTube video ID
- * @param lang - Optionele taalcode (bv. 'nl', 'en'). Eerste beschikbare taal bij leeg.
- * @returns Array van TranscriptSnippet objecten
- * @throws TranscriptNotAvailableError bij geen beschikbaar transcript
- * @throws TranscriptDisabledError als ondertiteling is uitgeschakeld
- * @throws QuotaExceededError bij te veel requests
- */
-export async function fetchTranscriptViaPackage(
-  videoId: string,
-  lang?: string,
-): Promise<TranscriptSnippet[]> {
-  try {
-    const config = lang ? { lang } : undefined;
-    const segments = await YoutubeTranscript.fetchTranscript(videoId, config);
-    if (!segments || segments.length === 0) {
-      throw new TranscriptNotAvailableError(videoId);
-    }
-    return segments.map((s) => ({
-      text: s.text,
-      start: s.offset / 1000, // milliseconden → seconden
-      duration: s.duration / 1000,
-    }));
-  } catch (err) {
-    // Vertaal youtube-transcript errors naar onze error classes
-    if (err instanceof TranscriptError) throw err;
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.toLowerCase().includes('disabled') || msg.includes('Transcript is disabled')) {
-      throw new TranscriptDisabledError(videoId);
-    }
-    if (msg.toLowerCase().includes('not available') || msg.includes('No transcripts')) {
-      throw new TranscriptNotAvailableError(videoId);
-    }
-    if (msg.toLowerCase().includes('too many request') || msg.toLowerCase().includes('captcha')) {
-      throw new QuotaExceededError(videoId);
-    }
-    throw new TranscriptError(`Fout bij ophalen transcript: ${msg}`, 502, videoId);
-  }
-}
-
-// ── SBV parsing ────────────────────────────────────────────────────
-
-/**
- * Parse SubViewer (SBV) formatted captions naar getimede snippets.
- *
- * SBV-formaat:
- * ```
- * 0:00:00.000,0:00:01.540
- * Hey there
- *
- * 0:00:02.000,0:00:04.500
- * How are you?
- * ```
- */
-export function parseSbv(sbvContent: string): TranscriptSnippet[] {
-  const snippets: TranscriptSnippet[] = [];
-
-  // Split op lege regels (dubbele newline)
-  const blocks = sbvContent.trim().split(/\r?\n\r?\n/);
-
-  for (const block of blocks) {
-    const lines = block.trim().split(/\r?\n/);
-    if (lines.length < 2) continue;
-
-    const timeLine = lines[0].trim();
-    const textLines = lines.slice(1).map(l => l.trim()).filter(l => l.length > 0);
-    if (textLines.length === 0) continue;
-
-    // Parse tijdsregel: 0:00:00.000,0:00:01.540
-    const timeMatch = timeLine.match(/^(\d+):(\d{2}):(\d{2})\.(\d{3}),(\d+):(\d{2}):(\d{2})\.(\d{3})$/);
-    if (!timeMatch) continue;
-
-    const start =
-      parseInt(timeMatch[1]) * 3600 +
-      parseInt(timeMatch[2]) * 60 +
-      parseInt(timeMatch[3]) +
-      parseInt(timeMatch[4]) / 1000;
-    const end =
-      parseInt(timeMatch[5]) * 3600 +
-      parseInt(timeMatch[6]) * 60 +
-      parseInt(timeMatch[7]) +
-      parseInt(timeMatch[8]) / 1000;
-    const duration = end - start;
-
-    snippets.push({
-      text: decodeHtmlEntities(textLines.join(' ')),
-      start,
-      duration: Math.max(0, duration),
-    });
-  }
-
-  return snippets;
-}
-
-/**
- * Decodeer HTML-entiteiten in een tekst.
- */
-function decodeHtmlEntities(text: string): string {
-  // Eerst alle andere entities decoderen, dan pas &amp; (anders zou &amp;quot; → quot; → " worden)
-  return text
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, '/')
-    .replace(/&amp;/g, '&');
-}
-
-// ── Taalkeuze ──────────────────────────────────────────────────────
-
-/**
- * Kies de beste caption track: NL > EN > eerste.
- */
-function pickBestCaptionTrack(tracks: CaptionTrack[]): CaptionTrack | null {
-  if (tracks.length === 0) return null;
-  const nl = tracks.find((t) => t.languageCode === 'nl');
-  if (nl) return nl;
-  const en = tracks.find((t) => t.languageCode === 'en');
-  if (en) return en;
-  return tracks[0];
-}
-
-// ── Hoofdfunctie ───────────────────────────────────────────────────
-
-/**
- * Haal het transcript van een YouTube-video op via de hybride aanpak.
- *
- * Doorloopt de volgende flow:
- * 1. Valideer video ID
- * 2. (Optioneel) captions.list via OAuth voor taaldetectie
- * 3. youtube-transcript package voor daadwerkelijke download (publieke video's)
- * 4. Fallback naar captions.download via OAuth (alleen voor eigen video's)
- *
- * @param videoId - YouTube video ID
- * @param clientId - OAuth 2.0 Client ID (optioneel, alleen voor taaldetectie/fallback)
- * @param clientSecret - OAuth 2.0 Client Secret
- * @param refreshToken - OAuth 2.0 Refresh Token
- * @returns TranscriptResult
- * @throws TranscriptError bij fouten
- */
-export async function getTranscriptYoutubeApi(
-  videoId: string,
-  clientId: string,
-  clientSecret: string,
-  refreshToken: string,
-): Promise<TranscriptResult> {
-  // Stap 1: Valideer video ID
-  if (!parseVideoId(videoId)) {
-    throw new InvalidVideoIdError(videoId);
-  }
-
-  // Stap 2: Optionele taaldetectie via OAuth (captions.list)
-  let selectedLanguage: string | undefined;
-  let tracks: CaptionTrack[] = [];
-  let oauthAvailable = false;
-
-  if (clientId && clientSecret && refreshToken) {
-    try {
-      const accessToken = await getAccessToken(clientId, clientSecret, refreshToken);
-      tracks = await fetchCaptionTracks(videoId, accessToken);
-      oauthAvailable = true;
-      const best = pickBestCaptionTrack(tracks);
-      if (best) selectedLanguage = best.languageCode;
-    } catch (err) {
-      // OAuth-fout is niet fataal — verder met standaard taal
-      console.error(`[transcript] OAuth taaldetectie mislukt voor ${videoId}:`,
-        err instanceof Error ? err.message : err);
-    }
-  }
-
-  // Stap 3: Download transcript via youtube-transcript package (publieke video's)
-  try {
-    const snippets = await fetchTranscriptViaPackage(videoId, selectedLanguage);
-    const fullText = snippets.map((s) => s.text).join(' ');
-
-    return {
-      videoId,
-      title: `Video ${videoId}`,
-      language: selectedLanguage || (snippets.length > 0 ? 'onbekend' : ''),
-      snippets,
-      fullText,
-      approach: 'youtube-transcript',
-    };
-  } catch (packageErr) {
-    // Stap 4: Fallback naar captions.download via OAuth (alleen eigen video's)
-    if (oauthAvailable && tracks.length > 0) {
-      console.error(`[transcript] Package download mislukt voor ${videoId}, probeer OAuth fallback:`,
-        packageErr instanceof Error ? packageErr.message : packageErr);
-
-      const selectedTrack = pickBestCaptionTrack(tracks);
-      if (!selectedTrack) {
-        throw packageErr; // Geen tracks beschikbaar
-      }
-
-      try {
-        const token = await getAccessToken(clientId, clientSecret, refreshToken);
-        const sbvContent = await downloadCaption(selectedTrack.id, token);
-        const snippets = parseSbv(sbvContent);
-
-        if (snippets.length === 0) {
-          throw packageErr;
-        }
-
-        const fullText = snippets.map((s) => s.text).join(' ');
-        return {
-          videoId,
-          title: `Video ${videoId}`,
-          language: selectedTrack.languageCode,
-          snippets,
-          fullText,
-          approach: 'youtube-data-api-v3',
-        };
-      } catch {
-        // Fallback faalt ook, gooi originele fout
-        throw packageErr;
-      }
-    }
-
-    // Geen fallback beschikbaar
-    throw packageErr;
-  }
-}
-
-/**
- * Download een transcript via de proxy relay (Cloudflare Tunnel → thuis-PC → YouTube).
+/** Download een transcript via de proxy relay (Cloudflare Tunnel → thuis-PC → YouTube).
  *
  * Maakt een InnerTube-request naar de generieke reverse proxy. De proxy
  * routeert via een consumer ISP, waardoor YouTube geen datacenter-IP blokkeert.
@@ -638,7 +120,6 @@ export async function fetchTranscriptViaProxy(
   }
 
   const proxyBase = proxyUrl.replace(/\/+$/, '');
-  console.log(`[transcript/proxy] Using proxy URL: ${proxyBase}`);
   const commonHeaders: Record<string, string> = {
     'x-api-key': apiKey,
     'x-forwarded-host': 'www.youtube.com',
@@ -705,31 +186,8 @@ export async function fetchTranscriptViaProxy(
     throw new TranscriptError('Ongeldige JSON-response van YouTube player API.', 502, videoId);
   }
 
-  // Debug: log response keys om te zien wat YouTube teruggeeft
-  console.log(`[transcript/proxy] Player response keys: ${Object.keys(playerData).join(', ')}`);
-  if (playerData.error) {
-    const errInfo = playerData.error as Record<string, unknown>;
-    console.log(`[transcript/proxy] YouTube API error: ${JSON.stringify(errInfo).slice(0, 300)}`);
-  }
-  console.log(`[transcript/proxy] Has captions: ${'captions' in playerData}`);
-
   // Navigeer: captions → playerCaptionsTracklistRenderer → captionTracks[]
   const captions = playerData.captions as Record<string, unknown> | undefined;
-  if (captions) {
-    console.log(`[transcript/proxy] captions keys: ${Object.keys(captions).join(', ')}`);
-    const tlr = captions.playerCaptionsTracklistRenderer as Record<string, unknown> | undefined;
-    if (tlr) {
-      console.log(`[transcript/proxy] tracklistRenderer keys: ${Object.keys(tlr).join(', ')}`);
-      const ct = tlr.captionTracks as Array<unknown> | undefined;
-      console.log(`[transcript/proxy] captionTracks: ${ct ? ct.length : 'undefined'}`);
-      if (ct && ct.length > 0) {
-        console.log(`[transcript/proxy] First track keys: ${Object.keys(ct[0] as Record<string, unknown>).join(', ')}`);
-        console.log(`[transcript/proxy] First track languageCode: ${(ct[0] as Record<string, unknown>).languageCode}`);
-      }
-    } else {
-      console.log(`[transcript/proxy] NO playerCaptionsTracklistRenderer in captions`);
-    }
-  }
   if (!captions) {
     throw new TranscriptNotAvailableError(videoId);
   }
@@ -763,7 +221,6 @@ export async function fetchTranscriptViaProxy(
   // ── Stap 2: GET naar baseUrl via proxy ──────────────────────────────
   const baseUrlObj = new URL(baseUrl);
   const proxyPath = baseUrlObj.pathname + baseUrlObj.search;
-  console.log(`[transcript/proxy] Transcript URL path: ${proxyPath}`);
 
   let transcriptResponse: Response;
   try {
@@ -786,8 +243,6 @@ export async function fetchTranscriptViaProxy(
     );
   }
 
-  console.log(`[transcript/proxy] Transcript response status: ${transcriptResponse.status}`);
-
   if (!transcriptResponse.ok) {
     throw new TranscriptError(
       `Transcript download fout (HTTP ${transcriptResponse.status}).`,
@@ -797,13 +252,23 @@ export async function fetchTranscriptViaProxy(
   }
 
   const xmlContent = await transcriptResponse.text();
-  console.log(`[transcript/proxy] Transcript XML length: ${xmlContent.length}`);
-  console.log(`[transcript/proxy] Transcript XML preview: ${xmlContent.slice(0, 300)}`);
 
   // ── Stap 3: Parse XML naar TranscriptSnippet[] ──────────────────────
-  const result = parseTranscriptXml(xmlContent, videoId);
-  console.log(`[transcript/proxy] Parsed ${result.length} snippets`);
-  return result;
+  return parseTranscriptXml(xmlContent, videoId);
+}
+
+/**
+ * Decodeer HTML-entiteiten in een tekst.
+ */
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, '/')
+    .replace(/&amp;/g, '&');
 }
 
 /**

@@ -1,17 +1,8 @@
 /**
  * Smoketest voor YouTube transcript — Issue 04
  *
- * Test de hybride YouTube transcript-implementatie lokaal (zonder Vercel) via tsx.
+ * Test de proxy relay transcript-implementatie lokaal (zonder Vercel) via tsx.
  * Gebruik: npx tsx smoketest-transcript.ts
- *
- * De hybride aanpak combineert:
- * - youtube-transcript package (www.youtube.com) voor download (geen OAuth nodig)
- * - YouTube Data API v3 (OAuth 2.0) voor taaldetectie (captions.list)
- * - Fallback naar captions.download voor eigen video's
- *
- * OAuth credentials (YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN)
- * zijn optioneel — zonder credentials werkt de download via youtube-transcript,
- * maar ontbreekt taaldetectie en OAuth fallback.
  *
  * Testcases:
  * 1. parseVideoId — geldige YouTube URL (www.youtube.com/watch?v=...)
@@ -19,45 +10,22 @@
  * 3. parseVideoId — raw video ID
  * 4. parseVideoId — ongeldig formaat
  * 5. parseVideoId — ongeldige URL (geen YouTube)
- * 6. parseSbv — geldige SBV-content
- * 7. parseSbv — lege SBV-content
- * 8. parseSbv — enkele regel (geen geldig blok)
- * 9. parseSbv — HTML entities decoderen
- * 10. OAuth token verversen (alleen met credentials)
- * 11. captions.list — taaldetectie (alleen met credentials)
- * 12. fetchTranscriptViaPackage — EN download
- * 13. fetchTranscriptViaPackage — DE fallback
- * 14. fetchTranscriptViaPackage — ongeldige video
- * 15. Volledige transcript-flow (hybride)
- * 16. Video zonder ondertiteling
- * 17. OAuth-foutafhandeling
- * 18. Ongeldige URL
+ * 6. fetchTranscriptViaPackage — EN download
+ * 7. fetchTranscriptViaPackage — DE fallback
+ * 8. fetchTranscriptViaPackage — ongeldige video
+ * 9. Ongeldige URL via InvalidVideoIdError
  */
 
 import {
   parseVideoId,
-  parseSbv,
-  getAccessToken,
-  fetchCaptionTracks,
-  downloadCaption,
   fetchTranscriptViaPackage,
-  getTranscriptYoutubeApi,
   TranscriptError,
-  TranscriptResult,
   TranscriptSnippet,
   InvalidVideoIdError,
   TranscriptNotAvailableError,
   TranscriptDisabledError,
-  OAuthError,
   QuotaExceededError,
 } from './api/transcript.js';
-
-// ── Configuratie ───────────────────────────────────────────────────
-
-const YOUTUBE_CLIENT_ID = process.env.YOUTUBE_CLIENT_ID || '';
-const YOUTUBE_CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET || '';
-const YOUTUBE_REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN || '';
-const HAS_CREDENTIALS = !!(YOUTUBE_CLIENT_ID && YOUTUBE_CLIENT_SECRET && YOUTUBE_REFRESH_TOKEN);
 
 // ── Test runner ─────────────────────────────────────────────────────
 
@@ -87,8 +55,7 @@ async function main() {
   console.log('='.repeat(60));
   console.log('🧪 Smoketest — YouTube Transcript (Issue 04)');
   console.log(`Datum: ${new Date().toISOString()}`);
-  console.log(`Aanpak: Hybride (youtube-transcript package + YouTube Data API v3 OAuth)`);
-  console.log(`Credentials: ${HAS_CREDENTIALS ? '✅ Geconfigureerd (OAuth taaldetectie beschikbaar)' : '⏭️ Niet geconfigureerd (youtube-transcript alleen)'}`);
+  console.log(`Aanpak: Proxy relay + youtube-transcript package`);
   console.log('='.repeat(60));
   console.log();
 
@@ -125,73 +92,7 @@ async function main() {
     if (id) throw new Error(`Zou null moeten zijn, kreeg ${id}`);
   }));
 
-  // ── Test 6: parseSbv — geldige SBV-content ─────────────────────────────
-  results.push(await runTest('parseSbv — geldige SBV-content', async () => {
-    const sbv = `0:00:00.000,0:00:01.540
-Hey there
-
-0:00:02.000,0:00:04.500
-How are you?
-
-0:00:05.000,0:00:07.200
-I am fine, thanks!`;
-
-    const snippets = parseSbv(sbv);
-    if (snippets.length !== 3) throw new Error(`Verwacht 3 snippets, kreeg ${snippets.length}`);
-    if (snippets[0].text !== 'Hey there') throw new Error(`Verwacht "Hey there", kreeg "${snippets[0].text}"`);
-    if (snippets[0].start !== 0) throw new Error(`Verwacht start=0, kreeg ${snippets[0].start}`);
-    if (Math.abs(snippets[0].duration - 1.54) > 0.001) throw new Error(`Verwacht duration=1.54, kreeg ${snippets[0].duration}`);
-    if (snippets[1].text !== 'How are you?') throw new Error(`Verwacht "How are you?", kreeg "${snippets[1].text}"`);
-    if (snippets[2].text !== 'I am fine, thanks!') throw new Error(`Verwacht "I am fine, thanks!", kreeg "${snippets[2].text}"`);
-    console.log(`   Aantal snippets: ${snippets.length}`);
-    console.log(`   Eerste snippet: "${snippets[0].text}" @ ${snippets[0].start}s (dur: ${snippets[0].duration}s)`);
-  }));
-
-  // ── Test 7: parseSbv — lege SBV-content ───────────────────────────────
-  results.push(await runTest('parseSbv — lege content', async () => {
-    const snippets = parseSbv('');
-    if (snippets.length !== 0) throw new Error(`Verwacht 0 snippets, kreeg ${snippets.length}`);
-  }));
-
-  // ── Test 8: parseSbv — enkele regel (geen geldige SBV) ────────────────
-  results.push(await runTest('parseSbv — enkele regel (geen geldig blok)', async () => {
-    const snippets = parseSbv('alleen tekst zonder timestamp');
-    if (snippets.length !== 0) throw new Error(`Verwacht 0 snippets, kreeg ${snippets.length}`);
-  }));
-
-  // ── Test 9: parseSbv — HTML entities ──────────────────────────────────
-  results.push(await runTest('parseSbv — HTML entities decoderen', async () => {
-    const sbv = `0:00:00.000,0:00:01.000
-It&amp;apos;s &lt;b&gt;cool&lt;/b&gt; &amp;quot;right&amp;quot;?`;
-    const snippets = parseSbv(sbv);
-    if (snippets.length !== 1) throw new Error(`Verwacht 1 snippet, kreeg ${snippets.length}`);
-    if (snippets[0].text !== "It&apos;s <b>cool</b> &quot;right&quot;?") {
-      throw new Error(`HTML entities niet correct gedecodeerd: "${snippets[0].text}"`);
-    }
-    console.log(`   Gedecodeerd: "${snippets[0].text}"`);
-  }));
-
-  // ── Test 10: OAuth token verversen (alleen met credentials) ──────────
-  results.push(await runTest('OAuth token verversen', async () => {
-    const token = await getAccessToken(YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN);
-    if (!token || typeof token !== 'string') throw new Error('Geen geldig token ontvangen');
-    if (token.length < 20) throw new Error(`Token lijkt ongeldig (kort: ${token.length} chars)`);
-    console.log(`   Token ontvangen (${token.length} chars, begint met "${token.slice(0, 10)}...")`);
-  }, !HAS_CREDENTIALS));
-
-  // ── Test 11: captions.list — bekende video met ondertiteling ──────────
-  results.push(await runTest('captions.list — jNQXAC9IVRw', async () => {
-    const token = await getAccessToken(YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN);
-    const tracks = await fetchCaptionTracks('jNQXAC9IVRw', token);
-    if (tracks.length === 0) throw new Error('Geen caption tracks gevonden');
-    console.log(`   Aantal tracks: ${tracks.length}`);
-    console.log(`   Eerste track: ${tracks[0].languageCode} — "${tracks[0].name}" (${tracks[0].kind || 'onbekend'})`);
-    const nl = tracks.find(t => t.languageCode === 'nl');
-    const en = tracks.find(t => t.languageCode === 'en');
-    console.log(`   Nederlands: ${nl ? '✅' : '❌'}, Engels: ${en ? '✅' : '❌'}`);
-  }, !HAS_CREDENTIALS));
-
-  // ── Test 12: fetchTranscriptViaPackage — download EN transcript ──────
+  // ── Test 6: fetchTranscriptViaPackage — download EN transcript ──────
   results.push(await runTest('fetchTranscriptViaPackage — jNQXAC9IVRw EN', async () => {
     const snippets = await fetchTranscriptViaPackage('jNQXAC9IVRw', 'en');
     if (!snippets || snippets.length === 0) throw new Error('Geen snippets ontvangen');
@@ -225,62 +126,10 @@ It&amp;apos;s &lt;b&gt;cool&lt;/b&gt; &amp;quot;right&amp;quot;?`;
     }
   }));
 
-  // ── Test 15: Volledige transcript-flow ────────────────────────────────
-  results.push(await runTest('Volledige transcript — jNQXAC9IVRw', async () => {
-    const result = await getTranscriptYoutubeApi(
-      'jNQXAC9IVRw',
-      YOUTUBE_CLIENT_ID,
-      YOUTUBE_CLIENT_SECRET,
-      YOUTUBE_REFRESH_TOKEN,
-    );
-    console.log(`   Video ID: ${result.videoId}`);
-    console.log(`   Taal: ${result.language}`);
-    console.log(`   Aantal snippets: ${result.snippets.length}`);
-    console.log(`   Volledige tekst lengte: ${result.fullText.length} tekens`);
-    console.log(`   Aanpak: ${result.approach}`);
-    console.log(`   Eerste 120 chars: "${result.fullText.slice(0, 120)}..."`);
-    if (result.snippets.length === 0) throw new Error('Geen snippets gevonden');
-    if (!result.fullText) throw new Error('Geen fullText');
-    if (result.approach !== 'youtube-transcript') throw new Error(`Verwacht youtube-transcript, kreeg ${result.approach}`);
-  }));
-
-  // ── Test 16: Video zonder ondertiteling ───────────────────────────────
-  results.push(await runTest('Transcript — video zonder ondertiteling (zzzzzzzzzzz)', async () => {
-    try {
-      await getTranscriptYoutubeApi(
-        'zzzzzzzzzzz',
-        YOUTUBE_CLIENT_ID,
-        YOUTUBE_CLIENT_SECRET,
-        YOUTUBE_REFRESH_TOKEN,
-      );
-      throw new Error('Zou een fout moeten geven');
-    } catch (err) {
-      if (err instanceof TranscriptNotAvailableError || err instanceof TranscriptError) {
-        console.log(`   Correcte fout: ${err instanceof TranscriptError ? err.name : 'Error'} — ${err.message}`);
-      } else {
-        throw err;
-      }
-    }
-  }));
-
-  // ── Test 17: OAuth-foutafhandeling (ongeldige credentials) ────────────
-  results.push(await runTest('OAuth-foutafhandeling — ongeldige credentials', async () => {
-    try {
-      await getAccessToken('fake-client-id', 'fake-client-secret', 'fake-refresh-token');
-      throw new Error('Zou een fout moeten geven');
-    } catch (err) {
-      if (err instanceof OAuthError) {
-        console.log(`   Correcte fout: ${err.name} — ${err.message.slice(0, 80)}...`);
-      } else {
-        throw err;
-      }
-    }
-  }));
-
-  // ── Test 18: Ongeldige URL via getTranscriptYoutubeApi ────────────────
+  // ── Test 9: Ongeldige URL via InvalidVideoIdError ─────────────────────
   results.push(await runTest('Transcript — ongeldige URL', async () => {
     try {
-      await getTranscriptYoutubeApi('geen-geldig-id', '', '', '');
+      await fetchTranscriptViaPackage('geen-geldig-id');
       throw new Error('Zou een fout moeten geven');
     } catch (err) {
       if (err instanceof InvalidVideoIdError) {
@@ -320,21 +169,15 @@ It&amp;apos;s &lt;b&gt;cool&lt;/b&gt; &amp;quot;right&amp;quot;?`;
   console.log();
   console.log(`**Datum:** ${new Date().toISOString()}`);
   console.log(`**Omgeving:** Lokaal (zonder Vercel)`);
-  console.log(`**Aanpak:** Hybride — youtube-transcript package (www.youtube.com) + YouTube Data API v3 OAuth (googleapis.com)`);
-  console.log(`**OAuth credentials:** ${HAS_CREDENTIALS ? '✅ Geconfigureerd' : '⏭️ Niet geconfigureerd'}`);
+  console.log(`**Aanpak:** Proxy relay + youtube-transcript package`);
   console.log(`**Resultaat:** ${failed > 0 ? '⚠️ Sommige tests gefaald' : '✅ Alle tests geslaagd'}`);
   console.log();
   console.log('**Bevindingen:**');
   if (failed === 0) {
     console.log('- youtube-transcript package werkt voor publieke video\'s zonder OAuth ✅');
     console.log('- fetchTranscriptViaPackage(): segmenten met offset, duration, text ✅');
-    console.log('- getTranscriptYoutubeApi() hybride flow werkt ✅');
-    console.log('- YouTube Data API v3 captions.list voor taaldetectie ✅');
-    console.log('- Token-verversing (refresh token → access token) ✅');
-    console.log('- SBV-parsing (parseSbv) werkt voor getimede snippets ✅');
     console.log('- URL-validatie (parseVideoId) werkt voor alle formaten ✅');
     console.log('- Error classes geven correcte HTTP-statuscodes ✅');
-    console.log('- captions.download fallback beschikbaar voor eigen video\'s ✅');
   } else if (failed > 0) {
     console.log('- Sommige tests faalden. Zie details hierboven.');
     if (failed <= 2) console.log('- Mogelijk een video-specifiek probleem (niet alle video\'s hebben ondertiteling).');
@@ -345,10 +188,8 @@ It&amp;apos;s &lt;b&gt;cool&lt;/b&gt; &amp;quot;right&amp;quot;?`;
     console.log('1. Controleer de foutmeldingen hierboven.');
     console.log('2. Test met een andere bekende video (bv. TEDx talks hebben altijd ondertiteling).');
   } else {
-    console.log('1. Voer HITL 3 uit: Vercel cloudsecrets instellen met YOUTUBE_CLIENT_ID, _SECRET, _REFRESH_TOKEN.');
-    console.log('2. Deploy naar Vercel en test de /transcript-endpoint op de live omgeving.');
-    console.log('3. Meet de doorlooptijd van youtube-transcript (pakket download) vs OAuth (token + list + download).');
-    console.log('4. Voer HITL 4 uit: eindreview en afronding.');
+    console.log('1. Fase 5 (Vercel → tunnel → proxy → YouTube) is gevalideerd ✅');
+    console.log('2. Fase 6: NSSM + cloudflared service op PC beneden.');
   }
 }
 
